@@ -252,13 +252,11 @@ ConsoleBatch::process()
             (*bgTask)();
 
             if (!verbose) {
-#ifdef _OPENMP
                 int done;
-                #pragma omp atomic capture
-                done = ++pages_done;
-#else
-                int done = ++pages_done;
+#ifdef _OPENMP
+                #pragma omp critical(pages_counter)
 #endif
+                done = ++pages_done;
                 if (done % 10 == 0 || done == num_pages) {
 #ifdef _OPENMP
                     #pragma omp critical(console_output)
