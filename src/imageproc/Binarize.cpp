@@ -225,7 +225,10 @@ BinaryImage binarizeWolf(
 
     double max_deviation = 1.0;
 
-    #pragma omp parallel for schedule(dynamic) reduction(max:max_deviation)
+    #pragma omp parallel
+    {
+    double local_max_dev = 1.0;
+    #pragma omp for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
         int const top = std::max(0, y - window_lower_half);
@@ -248,11 +251,16 @@ BinaryImage binarizeWolf(
 
             double const variance = sqmean - mean * mean;
             double const deviation = sqrt(fabs(variance));
-            max_deviation = std::max(max_deviation, deviation);
+            local_max_dev = std::max(local_max_dev, deviation);
             means[w * y + x] = mean;
             deviations[w * y + x] = deviation;
         }
     }
+    #pragma omp critical
+    {
+        max_deviation = std::max(max_deviation, local_max_dev);
+    }
+    } // omp parallel
 
     // TODO: integral images can be disposed at this point.
 
