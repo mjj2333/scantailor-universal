@@ -774,7 +774,7 @@ OutputGenerator::estimateBinarizationMask(
 
         // Morphological cleaning: threshold, close, open.
         BinaryImage variance_bw(variance_score, BinaryThreshold(128));
-        variance_bw = closeBrick(variance_bw, QSize(9, 9));
+        variance_bw = closeBrick(variance_bw, QSize(3, 3));
         variance_bw = openBrick(variance_bw, QSize(9, 9));
 
         if (dbg) {
@@ -1022,7 +1022,7 @@ OutputGenerator::estimateBinarizationMask(
                 // Sufficient picture content — use Otsu for T_high.
                 int otsu = BinaryThreshold::otsuThreshold(picture_areas);
                 t_high = std::max(30, std::min(80, otsu));
-                t_low = std::max(15, t_high * 5 / 10);
+                t_low = std::max(30, t_high * 6 / 10);
             }
         }
 
@@ -1053,6 +1053,10 @@ OutputGenerator::estimateBinarizationMask(
                 }
             }
         }
+
+        // Break thin bridges in candidate mask so seedFill cannot
+        // grow from photo regions into adjacent text through narrow gaps.
+        candidates = openBrick(candidates, QSize(3, 3));
 
         if (dbg) {
             dbg->add(seeds, "hysteresis_seeds");
