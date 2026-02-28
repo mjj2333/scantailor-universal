@@ -66,14 +66,20 @@ private:
 
     static Vec2f calcAvgUnitVector(std::pair<QLineF, QLineF> const& bounds);
 
+    static float estimateLineSpacing(Grid<float> const& deriv_grid, int width, int height);
+
     static imageproc::BinaryImage closeWithObstacles(
         imageproc::BinaryImage const& image,
         imageproc::BinaryImage const& obstacles, QSize const& brick);
 
     static QLineF calcMidLine(QLineF const& line1, QLineF const& line2);
 
+    static QLineF calcInterpLine(QLineF const& line1, QLineF const& line2, double fraction);
+
     static void findMidLineSeeds(
         imageproc::SEDM const& sedm, QLineF mid_line, std::vector<QPoint>& seeds);
+
+    static void deduplicateSeeds(std::vector<QPoint>& seeds, int min_dist_sq);
 
     static bool isCurvatureConsistent(std::vector<QPointF> const& polyline);
 
@@ -94,7 +100,8 @@ private:
     static QImage visualizeGradient(QImage const& background, Grid<float> const& grad);
 
     static QImage visualizeMidLineSeeds(QImage const& background, imageproc::BinaryImage const& overlay,
-                                        std::pair<QLineF, QLineF> bounds, QLineF mid_line, std::vector<QPoint> const& seeds);
+                                        std::pair<QLineF, QLineF> bounds, std::vector<QLineF> const& seed_lines,
+                                        std::vector<QPoint> const& seeds);
 
     static QImage visualizePolylines(
         QImage const& background, std::list<std::vector<QPointF> > const& polylines,

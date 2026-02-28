@@ -234,10 +234,22 @@ private:
         imageproc::GrayImage const& input_300dpi, TaskStatus const& status,
         DebugImages* dbg = 0);
 
+    static void boostMaskWithChroma(
+        imageproc::BinaryImage& mask, QImage const& color_source,
+        Dpi const& dpi);
+
+    static void contourize(
+        imageproc::BinaryImage const& mask,
+        std::vector<QPolygonF>& contours,
+        int sensitivity = 100);
+
     imageproc::BinaryImage estimateBinarizationMask(
         TaskStatus const& status, imageproc::GrayImage const& gray_source,
         QRect const& source_rect, QRect const& source_sub_rect,
         DebugImages* const dbg) const;
+
+    static imageproc::GrayImage featherMask(
+        imageproc::BinaryImage const& bw_mask, float sigma = 2.0f);
 
     void modifyBinarizationMask(
         imageproc::BinaryImage& bw_mask,

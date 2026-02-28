@@ -34,6 +34,7 @@
 #include <Qt>
 #include <QtGlobal>
 #include <QDebug>
+#include <QString>
 #include <limits>
 #include <algorithm>
 #include <math.h>
@@ -95,6 +96,9 @@ public:
     bool tangentMovement(Snake& snake, Grid<float> const& gradient);
 
     bool normalMovement(Snake& snake, Grid<float> const& gradient);
+
+    bool normalMovement(Snake& snake, Grid<float> const& gradient,
+                        Snake const* prev_snake, Snake const* next_snake);
 private:
     static float calcExternalEnergy(
         Grid<float> const& gradient, SnakeNode const& node, Vec2f const down_normal);
@@ -105,10 +109,14 @@ private:
     static float calcBendingEnergy(
         SnakeNode const& node, SnakeNode const& prev_node, SnakeNode const& prev_prev_node);
 
+    static float calcRepulsionEnergy(
+        Vec2f const& pos, Snake const* adjacent_snake, float min_dist);
+
     static float const m_elasticityWeight;
     static float const m_bendingWeight;
     static float const m_topExternalWeight;
     static float const m_bottomExternalWeight;
+    static float const m_repulsionWeight;
     float const m_factor;
     SnakeLength m_snakeLength;
     std::vector<FrenetFrame> m_frenetFrames;
@@ -146,28 +154,43 @@ TextLineRefiner::refine(
 
     Grid<float> gradient(m_image.width(), m_image.height(), /*padding=*/0);
 
-    // Start with a rather strong blur.
-    float h_sigma = (4.0f / 200.f) * m_dpi.horizontal();
-    float v_sigma = (4.0f / 200.f) * m_dpi.vertical();
-    calcBlurredGradient(gradient, h_sigma, v_sigma);
+    // Multi-scale coarse-to-fine evolution.
+    // Coarser scales (stronger blur) capture the broad shape of text lines,
+    // while finer scales lock onto precise edge positions.
+    float const base_h_sigma = (4.0f / 200.f) * m_dpi.horizontal();
+    float const base_v_sigma = (4.0f / 200.f) * m_dpi.vertical();
 
-    for (Snake& snake : snakes) {
-        evolveSnake(snake, gradient, ON_CONVERGENCE_STOP);
-    }
-    if (dbg) {
-        dbg->add(visualizeSnakes(snakes, &gradient), "evolved_snakes1");
-    }
+    struct ScalePass {
+        float sigma_factor;
+        int iterations;
+        OnConvergence on_convergence;
+    };
 
-    // Less blurring this time.
-    h_sigma *= 0.5f;
-    v_sigma *= 0.5f;
-    calcBlurredGradient(gradient, h_sigma, v_sigma);
+    ScalePass const passes[] = {
+        { 1.0f,  20, ON_CONVERGENCE_STOP },      // Coarsest: capture broad shape
+        { 0.6f,  20, ON_CONVERGENCE_STOP },       // Medium-coarse: refine curvature
+        { 0.35f, 25, ON_CONVERGENCE_STOP },       // Medium-fine: sharpen edges
+        { 0.2f,  35, ON_CONVERGENCE_GO_FINER },   // Finest: lock onto precise positions
+    };
 
-    for (Snake& snake : snakes) {
-        evolveSnake(snake, gradient, ON_CONVERGENCE_GO_FINER);
-    }
-    if (dbg) {
-        dbg->add(visualizeSnakes(snakes, &gradient), "evolved_snakes2");
+    int pass_num = 0;
+    for (ScalePass const& pass : passes) {
+        ++pass_num;
+
+        calcBlurredGradient(gradient, base_h_sigma * pass.sigma_factor,
+                                      base_v_sigma * pass.sigma_factor);
+
+        for (size_t si = 0; si < snakes.size(); ++si) {
+            snakes[si].iterationsRemaining = pass.iterations;
+            Snake const* prev = (si > 0) ? &snakes[si - 1] : nullptr;
+            Snake const* next = (si + 1 < snakes.size()) ? &snakes[si + 1] : nullptr;
+            evolveSnake(snakes[si], gradient, pass.on_convergence, prev, next);
+        }
+
+        if (dbg) {
+            QString label = QString("evolved_snakes%1").arg(pass_num);
+            dbg->add(visualizeSnakes(snakes, &gradient), label.toLatin1().constData());
+        }
     }
 
     // Convert from snakes back to polylines.
@@ -335,6 +358,14 @@ void
 TextLineRefiner::evolveSnake(Snake& snake, Grid<float> const& gradient,
                              OnConvergence const on_convergence) const
 {
+    evolveSnake(snake, gradient, on_convergence, nullptr, nullptr);
+}
+
+void
+TextLineRefiner::evolveSnake(Snake& snake, Grid<float> const& gradient,
+                             OnConvergence const on_convergence,
+                             Snake const* prev_snake, Snake const* next_snake) const
+{
     float factor = 1.0f;
 
     while (snake.iterationsRemaining > 0) {
@@ -344,7 +375,7 @@ TextLineRefiner::evolveSnake(Snake& snake, Grid<float> const& gradient,
         bool changed = false;
         changed |= optimizer.thicknessAdjustment(snake, gradient);
         changed |= optimizer.tangentMovement(snake, gradient);
-        changed |= optimizer.normalMovement(snake, gradient);
+        changed |= optimizer.normalMovement(snake, gradient, prev_snake, next_snake);
 
         if (!changed) {
             //qDebug() << "Converged.  Iterations remaining = " << snake.iterationsRemaining;
@@ -509,6 +540,7 @@ float const TextLineRefiner::Optimizer::m_elasticityWeight = 0.2f;
 float const TextLineRefiner::Optimizer::m_bendingWeight = 1.8f;
 float const TextLineRefiner::Optimizer::m_topExternalWeight = 1.0f;
 float const TextLineRefiner::Optimizer::m_bottomExternalWeight = 1.0f;
+float const TextLineRefiner::Optimizer::m_repulsionWeight = 2.0f;
 
 TextLineRefiner::Optimizer::Optimizer(
     Snake const& snake, Vec2f const& unit_down_vec, float factor)
@@ -667,10 +699,22 @@ TextLineRefiner::Optimizer::tangentMovement(Snake& snake, Grid<float> const& gra
 bool
 TextLineRefiner::Optimizer::normalMovement(Snake& snake, Grid<float> const& gradient)
 {
+    return normalMovement(snake, gradient, nullptr, nullptr);
+}
+
+bool
+TextLineRefiner::Optimizer::normalMovement(
+    Snake& snake, Grid<float> const& gradient,
+    Snake const* prev_snake, Snake const* next_snake)
+{
     size_t const num_nodes = snake.nodes.size();
     if (num_nodes < 3) {
         return false;
     }
+
+    // Minimum distance before repulsion kicks in.
+    // Roughly one line-spacing worth of pixels.
+    float const min_repulsion_dist = 20.0f;
 
     float const normal_movements[] = { 0.0f * m_factor, 1.0f * m_factor, -1.0f * m_factor };
     enum { NUM_NORMAL_MOVEMENTS = sizeof(normal_movements) / sizeof(normal_movements[0]) };
@@ -694,7 +738,9 @@ TextLineRefiner::Optimizer::normalMovement(Snake& snake, Grid<float> const& grad
             step.node.center = snake.nodes[0].center + normal_movements[i] * down_normal;
             step.node.ribHalfLength = snake.nodes[0].ribHalfLength;
             step.prevStepIdx = ~uint32_t(0);
-            step.pathCost = calcExternalEnergy(gradient, step.node, down_normal);
+            step.pathCost = calcExternalEnergy(gradient, step.node, down_normal)
+                          + calcRepulsionEnergy(step.node.center, prev_snake, min_repulsion_dist)
+                          + calcRepulsionEnergy(step.node.center, next_snake, min_repulsion_dist);
 
             step_storage.push_back(step);
         }
@@ -708,7 +754,9 @@ TextLineRefiner::Optimizer::normalMovement(Snake& snake, Grid<float> const& grad
             step.node.ribHalfLength = snake.nodes[1].ribHalfLength;
             step.prevStepIdx = prev_step_idx;
             step.pathCost = step_storage[prev_step_idx].pathCost +
-                            calcExternalEnergy(gradient, step.node, down_normal);
+                            calcExternalEnergy(gradient, step.node, down_normal)
+                          + calcRepulsionEnergy(step.node.center, prev_snake, min_repulsion_dist)
+                          + calcRepulsionEnergy(step.node.center, next_snake, min_repulsion_dist);
 
             paths.push_back(step_storage.size());
             step_storage.push_back(step);
@@ -726,7 +774,9 @@ TextLineRefiner::Optimizer::normalMovement(Snake& snake, Grid<float> const& grad
             step.node.ribHalfLength = node.ribHalfLength;
             step.pathCost = NumericTraits<float>::max();
 
-            float const base_cost = calcExternalEnergy(gradient, step.node, down_normal);
+            float const base_cost = calcExternalEnergy(gradient, step.node, down_normal)
+                                  + calcRepulsionEnergy(step.node.center, prev_snake, min_repulsion_dist)
+                                  + calcRepulsionEnergy(step.node.center, next_snake, min_repulsion_dist);
 
             // Now find the best step for the previous node to combine with.
             for (uint32_t prev_step_idx : paths) {
@@ -835,6 +885,34 @@ TextLineRefiner::Optimizer::calcBendingEnergy(
 
     Vec2f const bend_vec(vec / vec_len - prev_vec / prev_vec_len);
     return m_bendingWeight * bend_vec.squaredNorm();
+}
+
+float
+TextLineRefiner::Optimizer::calcRepulsionEnergy(
+    Vec2f const& pos, Snake const* adjacent_snake, float const min_dist)
+{
+    if (!adjacent_snake || adjacent_snake->nodes.empty()) {
+        return 0.0f;
+    }
+
+    // Find the closest node in the adjacent snake.
+    float min_sqdist = NumericTraits<float>::max();
+    for (SnakeNode const& adj_node : adjacent_snake->nodes) {
+        float const sqdist = (pos - adj_node.center).squaredNorm();
+        if (sqdist < min_sqdist) {
+            min_sqdist = sqdist;
+        }
+    }
+
+    float const dist = sqrt(min_sqdist);
+    if (dist >= min_dist) {
+        return 0.0f;
+    }
+
+    // Quadratic penalty that grows as the snake approaches the neighbor.
+    // Zero at min_dist, maximum at dist=0.
+    float const ratio = 1.0f - (dist / min_dist);
+    return m_repulsionWeight * ratio * ratio;
 }
 
 } // namespace dewarping

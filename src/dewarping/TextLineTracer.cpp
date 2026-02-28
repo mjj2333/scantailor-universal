@@ -354,8 +354,21 @@ TextLineTracer::extractTextLines(
         dbg->add(visualizeGradient(image, main_grid), "first_dir_deriv");
     }
 
+    // Estimate line spacing from the directional derivative to adapt blur sigmas.
+    // The base sigmas (6.0, 12.0) are tuned for ~33px line spacing at 200 DPI.
+    float const estimated_spacing = estimateLineSpacing(main_grid, width, height);
+    float const default_spacing = 33.0f;
+    float sigma_scale = estimated_spacing / default_spacing;
+
+    // Clamp to a reasonable range to avoid extreme values on
+    // unusual pages (e.g., all-picture or single-line text).
+    sigma_scale = std::max<float>(0.5f, std::min<float>(sigma_scale, 2.5f));
+
+    float const sigma1 = 6.0f * sigma_scale;
+    float const sigma2 = 12.0f * sigma_scale;
+
     gaussBlurGeneric(
-        size, 6.0f, 6.0f,
+        size, sigma1, sigma1,
         main_grid.data(), main_grid.stride(), [=](float val) { return val; },
         main_grid.data(), main_grid.stride(), [=](float& n, float val) { n = val; }
     );
@@ -381,12 +394,66 @@ TextLineTracer::extractTextLines(
         dbg->add(visualizeGradient(image, main_grid), "second_dir_deriv");
     }
 
-    float max = 0;
+    // Adaptive threshold based on percentile of positive second-derivative values.
+    // The old fixed ratio (max * 15/255 ~= 5.9% of peak) fails on low-contrast
+    // scans (too much noise passes) and pages with high-contrast illustrations
+    // (threshold too high, faint text lines are lost).
+    //
+    // Instead, we collect all positive values into a histogram and pick the
+    // threshold at a percentile that separates text-line edge responses from
+    // background noise.  Empirically, the 85th percentile of positive values
+    // works well across a wide range of content types.
+    float max_val = 0;
+    int positive_count = 0;
     rasterOpGeneric(
         main_grid.data(), main_grid.stride(), size,
-                [&max](const float& f) { if (f > max) max = f; }
+                [&max_val, &positive_count](const float& f) {
+                    if (f > 0) {
+                        ++positive_count;
+                        if (f > max_val) max_val = f;
+                    }
+                }
     );
-    float const threshold = max * 15.0f / 255.0f;
+
+    float threshold;
+    if (positive_count < 100 || max_val < std::numeric_limits<float>::epsilon()) {
+        // Too few positive values to build a meaningful histogram.
+        // Fall back to the original fixed ratio.
+        threshold = max_val * 15.0f / 255.0f;
+    } else {
+        // Build a 256-bin histogram of positive values.
+        int const NUM_BINS = 256;
+        std::vector<int> histogram(NUM_BINS, 0);
+        float const bin_scale = (NUM_BINS - 1) / max_val;
+
+        rasterOpGeneric(
+            main_grid.data(), main_grid.stride(), size,
+                    [&histogram, bin_scale](const float& f) {
+                        if (f > 0) {
+                            int bin = static_cast<int>(f * bin_scale);
+                            ++histogram[bin];
+                        }
+                    }
+        );
+
+        // Find the 85th percentile.
+        int const target = static_cast<int>(positive_count * 0.85f);
+        int cumulative = 0;
+        int threshold_bin = 0;
+        for (int i = 0; i < NUM_BINS; ++i) {
+            cumulative += histogram[i];
+            if (cumulative >= target) {
+                threshold_bin = i;
+                break;
+            }
+        }
+        threshold = (threshold_bin + 0.5f) / bin_scale;
+
+        // Safety clamp: never go below 3% or above 15% of max.
+        float const min_threshold = max_val * 3.0f / 100.0f;
+        float const max_threshold = max_val * 15.0f / 100.0f;
+        threshold = std::max<float>(min_threshold, std::min<float>(threshold, max_threshold));
+    }
 
     BinaryImage initial_binarization(image.size());
     rasterOpGeneric(
@@ -407,7 +474,7 @@ TextLineTracer::extractTextLines(
     }
 
     gaussBlurGeneric(
-        size, 12.0f, 12.0f,
+        size, sigma2, sigma2,
         aux_grid.data(), aux_grid.stride(), [=](float val) { return val; },
         aux_grid.data(), aux_grid.stride(), [=](float& n, float val) { n = val; }
     );
@@ -464,10 +531,23 @@ TextLineTracer::extractTextLines(
     SEDM const sedm(post_binarization);
 
     std::vector<QPoint> seeds;
-    QLineF mid_line(calcMidLine(bounds.first, bounds.second));
-    findMidLineSeeds(sedm, mid_line, seeds);
+
+    // Use multiple seed lines across the page width to catch text lines
+    // that don't intersect the center line on significantly warped pages.
+    double const fractions[] = { 0.25, 0.5, 0.75 };
+    std::vector<QLineF> seed_lines;
+    for (double frac : fractions) {
+        QLineF const seed_line(calcInterpLine(bounds.first, bounds.second, frac));
+        seed_lines.push_back(seed_line);
+        findMidLineSeeds(sedm, seed_line, seeds);
+    }
+
+    // Remove duplicate seeds found by different seed lines.
+    // Seeds within 10px of each other likely correspond to the same text line.
+    deduplicateSeeds(seeds, 10 * 10);
+
     if (dbg) {
-        dbg->add(visualizeMidLineSeeds(image, post_binarization, bounds, mid_line, seeds), "seeds");
+        dbg->add(visualizeMidLineSeeds(image, post_binarization, bounds, seed_lines, seeds), "seeds");
     }
 
     post_binarization.release(); // Save memory.
@@ -512,6 +592,57 @@ TextLineTracer::calcAvgUnitVector(std::pair<QLineF, QLineF> const& bounds)
     return v3;
 }
 
+float
+TextLineTracer::estimateLineSpacing(Grid<float> const& deriv_grid, int const width, int const height)
+{
+    // Compute a row-wise projection profile: sum of absolute derivative values per row.
+    // The periodicity of this profile corresponds to the text line spacing.
+    std::vector<float> profile(height, 0.0f);
+    float const* data = deriv_grid.data();
+    int const stride = deriv_grid.stride();
+
+    for (int y = 0; y < height; ++y) {
+        float row_sum = 0.0f;
+        for (int x = 0; x < width; ++x) {
+            row_sum += std::fabs(data[y * stride + x]);
+        }
+        profile[y] = row_sum;
+    }
+
+    // Autocorrelation to find dominant period.
+    // Typical line spacing at 200 DPI: 15-60 pixels.
+    int const min_lag = 10;
+    int const max_lag = std::min<int>(80, height / 3);
+
+    if (max_lag <= min_lag) {
+        return 33.0f; // Default for very small images.
+    }
+
+    // Compute mean for normalization.
+    float mean = 0.0f;
+    for (int y = 0; y < height; ++y) {
+        mean += profile[y];
+    }
+    mean /= height;
+
+    float best_corr = 0.0f;
+    int best_lag = 33; // Default.
+
+    for (int lag = min_lag; lag <= max_lag; ++lag) {
+        float corr = 0.0f;
+        int n = height - lag;
+        for (int y = 0; y < n; ++y) {
+            corr += (profile[y] - mean) * (profile[y + lag] - mean);
+        }
+        if (corr > best_corr) {
+            best_corr = corr;
+            best_lag = lag;
+        }
+    }
+
+    return static_cast<float>(best_lag);
+}
+
 BinaryImage
 TextLineTracer::closeWithObstacles(
     BinaryImage const& image, BinaryImage const& obstacles, QSize const& brick)
@@ -550,16 +681,50 @@ TextLineTracer::findMidLineSeeds(SEDM const& sedm, QLineF mid_line, std::vector<
     }
 }
 
+void
+TextLineTracer::deduplicateSeeds(std::vector<QPoint>& seeds, int const min_dist_sq)
+{
+    // Remove seeds that are too close to an earlier seed.
+    // This handles the case where multiple seed lines discover the same text line.
+    std::vector<QPoint> unique_seeds;
+    unique_seeds.reserve(seeds.size());
+
+    for (QPoint const& seed : seeds) {
+        bool is_duplicate = false;
+        for (QPoint const& existing : unique_seeds) {
+            int const dx = seed.x() - existing.x();
+            int const dy = seed.y() - existing.y();
+            if (dx * dx + dy * dy < min_dist_sq) {
+                is_duplicate = true;
+                break;
+            }
+        }
+        if (!is_duplicate) {
+            unique_seeds.push_back(seed);
+        }
+    }
+
+    seeds.swap(unique_seeds);
+}
+
 QLineF
 TextLineTracer::calcMidLine(QLineF const& line1, QLineF const& line2)
+{
+    return calcInterpLine(line1, line2, 0.5);
+}
+
+QLineF
+TextLineTracer::calcInterpLine(QLineF const& line1, QLineF const& line2, double const fraction)
 {
     QPointF intersection;
     if (QLineIntersect(line1, line2, &intersection) == QLineF::NoIntersection) {
         // Lines are parallel.
         QPointF const p1(line2.p1());
         QPointF const p2(ToLineProjector(line1).projectionPoint(p1));
-        QPointF const origin(0.5 * (p1 + p2));
-        QPointF const vector(line2.p2() - line2.p1());
+        QPointF const origin(p2 + fraction * (p1 - p2));
+        QPointF const v1(line1.p2() - line1.p1());
+        QPointF const v2(line2.p2() - line2.p1());
+        QPointF const vector(v1 + fraction * (v2 - v1));
         return QLineF(origin, origin + vector);
     } else {
         // Lines do intersect.
@@ -567,7 +732,8 @@ TextLineTracer::calcMidLine(QLineF const& line1, QLineF const& line2)
         Vec2d v2(line2.p2() - line2.p1());
         v1 /= sqrt(v1.squaredNorm());
         v2 /= sqrt(v2.squaredNorm());
-        return QLineF(intersection, intersection + 0.5 * (v1 + v2));
+        Vec2d const blended(v1 + fraction * (v2 - v1));
+        return QLineF(intersection, intersection + blended);
     }
 }
 
@@ -648,7 +814,7 @@ TextLineTracer::visualizeGradient(QImage const& background, Grid<float> const& g
 QImage
 TextLineTracer::visualizeMidLineSeeds(
     QImage const& background, BinaryImage const& overlay,
-    std::pair<QLineF, QLineF> bounds, QLineF mid_line,
+    std::pair<QLineF, QLineF> bounds, std::vector<QLineF> const& seed_lines,
     std::vector<QPoint> const& seeds)
 {
     QImage canvas(background.convertToFormat(QImage::Format_ARGB32_Premultiplied));
@@ -659,7 +825,6 @@ TextLineTracer::visualizeMidLineSeeds(
 
     lineBoundedByRect(bounds.first, background.rect());
     lineBoundedByRect(bounds.second, background.rect());
-    lineBoundedByRect(mid_line, background.rect());
 
     QPen pen(QColor(0x00, 0x00, 0xff, 180));
     pen.setWidthF(5.0);
@@ -668,8 +833,12 @@ TextLineTracer::visualizeMidLineSeeds(
     painter.drawLine(bounds.second);
 
     pen.setColor(QColor(0x00, 0xff, 0x00, 180));
+    pen.setWidthF(3.0);
     painter.setPen(pen);
-    painter.drawLine(mid_line);
+    for (QLineF seed_line : seed_lines) {
+        lineBoundedByRect(seed_line, background.rect());
+        painter.drawLine(seed_line);
+    }
 
     painter.setPen(Qt::NoPen);
     painter.setBrush(QColor(0x2d, 0x00, 0x6d, 255));

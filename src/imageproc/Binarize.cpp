@@ -115,8 +115,12 @@ BinaryImage binarizeSauvola(
     double const range = 128.0;
     double const frac_d = (double) delta / range;
     uint32_t const msb = uint32_t(1) << 31;
-    gray_line = gray.bits();
+    uint8_t const* const gray_data = gray.bits();
+    uint32_t* const bw_data = bw_img.data();
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; ++y) {
+        uint8_t const* const gray_line = gray_data + y * gray_bpl;
+        uint32_t* const bw_line = bw_data + y * bw_wpl;
         int const top = std::max(0, y - window_lower_half);
         int const bottom = std::min(h, y + window_upper_half); // exclusive
 
@@ -127,18 +131,18 @@ BinaryImage binarizeSauvola(
             assert(area > 0); // because window_size > 0 and w > 0 and h > 0
 
             QRect const rect(left, top, right - left, bottom - top);
-            long double const window_sum = integral_image.sum(rect);
-            long double const window_sqsum = integral_sqimage.sum(rect);
+            double const window_sum = integral_image.sum(rect);
+            double const window_sqsum = integral_sqimage.sum(rect);
 
-            long double const r_area = 1.0 / area;
-            long double const mean = window_sum * r_area;
-            long double const sqmean = window_sqsum * r_area;
+            double const r_area = 1.0 / area;
+            double const mean = window_sum * r_area;
+            double const sqmean = window_sqsum * r_area;
 
-            long double const variance = sqmean - mean * mean;
-            long double const deviation = sqrt(fabs(variance));
-            long double const frac_s = deviation / range;
+            double const variance = sqmean - mean * mean;
+            double const deviation = sqrt(fabs(variance));
+            double const frac_s = deviation / range;
 
-            long double const threshold = mean * (1.0 - k * (1.0 - (frac_s + frac_d)));
+            double const threshold = mean * (1.0 - k * (1.0 - (frac_s + frac_d)));
 
             uint32_t const mask = msb >> (x & 31);
             int const origin = gray_line[x];
@@ -153,8 +157,6 @@ BinaryImage binarizeSauvola(
                 bw_line[x >> 5] &= ~mask;
             }
         }
-        gray_line += gray_bpl;
-        bw_line += bw_wpl;
     }
 
     return bw_img;
@@ -221,8 +223,12 @@ BinaryImage binarizeWolf(
     std::vector<float> means(w * h, 0);
     std::vector<float> deviations(w * h, 0);
 
-    long double max_deviation = 1.0;
+    double max_deviation = 1.0;
 
+    #pragma omp parallel
+    {
+    double local_max_dev = 1.0;
+    #pragma omp for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
         int const top = std::max(0, y - window_lower_half);
@@ -236,20 +242,25 @@ BinaryImage binarizeWolf(
             assert(area > 0); // because window_size > 0 and w > 0 and h > 0
 
             QRect const rect(left, top, right - left, bottom - top);
-            long double const window_sum = integral_image.sum(rect);
-            long double const window_sqsum = integral_sqimage.sum(rect);
+            double const window_sum = integral_image.sum(rect);
+            double const window_sqsum = integral_sqimage.sum(rect);
 
-            long double const r_area = 1.0 / area;
-            long double const mean = window_sum * r_area;
-            long double const sqmean = window_sqsum * r_area;
+            double const r_area = 1.0 / area;
+            double const mean = window_sum * r_area;
+            double const sqmean = window_sqsum * r_area;
 
-            long double const variance = sqmean - mean * mean;
-            long double const deviation = sqrt(fabs(variance));
-            max_deviation = std::max(max_deviation, deviation);
+            double const variance = sqmean - mean * mean;
+            double const deviation = sqrt(fabs(variance));
+            local_max_dev = std::max(local_max_dev, deviation);
             means[w * y + x] = mean;
             deviations[w * y + x] = deviation;
         }
     }
+    #pragma omp critical
+    {
+        max_deviation = std::max(max_deviation, local_max_dev);
+    }
+    } // omp parallel
 
     // TODO: integral images can be disposed at this point.
 
@@ -264,17 +275,21 @@ BinaryImage binarizeWolf(
     double const range = 128.0;
     double const frac_d = (double) delta / range;
     uint32_t const msb = uint32_t(1) << 31;
-    gray_line = gray.bits();
+    uint8_t const* const gray_data_w = gray.bits();
+    uint32_t* const bw_data_w = bw_img.data();
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
+        uint8_t const* const gray_line = gray_data_w + y * gray_bpl;
+        uint32_t* const bw_line = bw_data_w + y * bw_wpl;
         for (int x = 0; x < w; x++)
         {
             float const mean = means[y * w + x];
             float const deviation = deviations[y * w + x];
             
-            long double const base = mean - min_gray_level;
-            long double const frac_sn = deviation / max_deviation;
-            long double const threshold = base * (1.0 - k * (1.0 - (frac_sn + frac_d))) + min_gray_level;
+            double const base = mean - min_gray_level;
+            double const frac_sn = deviation / max_deviation;
+            double const threshold = base * (1.0 - k * (1.0 - (frac_sn + frac_d))) + min_gray_level;
 
             uint32_t const mask = msb >> (x & 31);
             unsigned char const origin = gray_line[x];
@@ -287,8 +302,6 @@ BinaryImage binarizeWolf(
                 bw_line[x >> 5] &= ~mask;
             }
         }
-        gray_line += gray_bpl;
-        bw_line += bw_wpl;
     }
 
     return bw_img;
@@ -359,9 +372,9 @@ BinaryImage binarizeWindow(
 
     int const areaFull = w * h;
     assert(areaFull > 0); // because w > 0 and h > 0
-    long double const meanFull = integral_image.sum(QRect(0, 0, w, h)) / areaFull;
-    long double deviationMax = 0.0;
-    long double deviationMin = 256.0;
+    double const meanFull = integral_image.sum(QRect(0, 0, w, h)) / areaFull;
+    double deviationMax = 0.0;
+    double deviationMin = 256.0;
     
     for (int y = 0; y < h; y++)
     {
@@ -376,22 +389,22 @@ BinaryImage binarizeWindow(
             assert(area > 0); // because window_size > 0 and w > 0 and h > 0
 
             QRect const rect(left, top, right - left, bottom - top);
-            long double const window_sum = integral_image.sum(rect);
-            long double const window_sqsum = integral_sqimage.sum(rect);
+            double const window_sum = integral_image.sum(rect);
+            double const window_sqsum = integral_sqimage.sum(rect);
 
-            long double const r_area = 1.0 / area;
-            long double const mean = window_sum * r_area;
-            long double const sqmean = window_sqsum * r_area;
+            double const r_area = 1.0 / area;
+            double const mean = window_sum * r_area;
+            double const sqmean = window_sqsum * r_area;
 
-            long double const variance = sqmean - mean * mean;
-            long double const deviation = sqrt(fabs(variance));
+            double const variance = sqmean - mean * mean;
+            double const deviation = sqrt(fabs(variance));
 
             deviationMax = (deviation > deviationMax) ? deviation : deviationMax;
             deviationMin = (deviation < deviationMin) ? deviation : deviationMin;
         }
     }
 
-    long double deviationD = (deviationMax > deviationMin) ? (deviationMax - deviationMin) : 1.0;
+    double deviationD = (deviationMax > deviationMin) ? (deviationMax - deviationMin) : 1.0;
 
     BinaryImage bw_img(w, h);
     if (bw_img.isNull())
@@ -402,9 +415,13 @@ BinaryImage binarizeWindow(
     int const bw_wpl = bw_img.wordsPerLine();
 
     uint32_t const msb = uint32_t(1) << 31;
-    gray_line = gray.bits();
+    uint8_t const* const gray_data_win = gray.bits();
+    uint32_t* const bw_data_win = bw_img.data();
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
+        uint8_t const* const gray_line = gray_data_win + y * gray_bpl;
+        uint32_t* const bw_line = bw_data_win + y * bw_wpl;
         int const top = (y > window_lower_half) ? (y -window_lower_half) : 0;;
         int const bottom = ((y +  window_upper_half) < h) ? (y +  window_upper_half) : h;
 
@@ -416,22 +433,22 @@ BinaryImage binarizeWindow(
             assert(area > 0); // because window_size > 0 and w > 0 and h > 0
 
             QRect const rect(left, top, right - left, bottom - top);
-            long double const window_sum = integral_image.sum(rect);
-            long double const window_sqsum = integral_sqimage.sum(rect);
+            double const window_sum = integral_image.sum(rect);
+            double const window_sqsum = integral_sqimage.sum(rect);
 
-            long double const r_area = 1.0 / area;
-            long double const mean = window_sum * r_area;
-            long double const sqmean = window_sqsum * r_area;
+            double const r_area = 1.0 / area;
+            double const mean = window_sum * r_area;
+            double const sqmean = window_sqsum * r_area;
 
-            long double const variance = sqmean - mean * mean;
-            long double const deviation = sqrt(fabs(variance));
+            double const variance = sqmean - mean * mean;
+            double const deviation = sqrt(fabs(variance));
 
-            long double const md = (mean + 1.0 - delta) / (meanFull + deviation + 1.0);
-            long double const kdm = (meanFull + meanFull + 1.0) / (deviation + 1.0);
-            long double const kds = (deviation - deviationMin) / deviationD;
-            long double const kd = 1.0 + kdm * kds;
+            double const md = (mean + 1.0 - delta) / (meanFull + deviation + 1.0);
+            double const kdm = (meanFull + meanFull + 1.0) / (deviation + 1.0);
+            double const kds = (deviation - deviationMin) / deviationD;
+            double const kd = 1.0 + kdm * kds;
 
-            long double const threshold = mean * (1.0 - k * 3.0 * md / kd);
+            double const threshold = mean * (1.0 - k * 3.0 * md / kd);
             
             uint32_t const mask = msb >> (x & 31);
             unsigned char const origin = gray_line[x];
@@ -444,8 +461,6 @@ BinaryImage binarizeWindow(
                 bw_line[x >> 5] &= ~mask;
             }
         }
-        gray_line += gray_bpl;
-        bw_line += bw_wpl;
     }
 
     return bw_img;
@@ -502,9 +517,13 @@ BinaryImage binarizeBradley(
     int const bw_wpl = bw_img.wordsPerLine();
 
     uint32_t const msb = uint32_t(1) << 31;
-    gray_line = gray.bits();
+    uint8_t const* const gray_data_brad = gray.bits();
+    uint32_t* const bw_data_brad = bw_img.data();
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
+        uint8_t const* const gray_line = gray_data_brad + y * gray_bpl;
+        uint32_t* const bw_line = bw_data_brad + y * bw_wpl;
         int const top = std::max(0, y - window_lower_half);
         int const bottom = std::min(h, y + window_upper_half);  // exclusive
         for (int x = 0; x < w; x++)
@@ -531,8 +550,6 @@ BinaryImage binarizeBradley(
                 bw_line[x >> 5] &= ~mask;
             }
         }
-        gray_line += gray_bpl;
-        bw_line += bw_wpl;
     }
     return bw_img;
 }  // binarizeBradley
@@ -592,8 +609,12 @@ BinaryImage binarizeGrad(
     int const window_left_half = window_size.width() >> 1;
     int const window_right_half = window_size.width() - window_left_half;
 
+    uint8_t const* const gray_data_grad = gray.bits();
+    uint8_t* const gmean_data = gmean.bits();
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
+        uint8_t* const gmean_line = gmean_data + y * gmean_bpl;
         int const top = std::max(0, y - window_lower_half);
         int const bottom = std::min(h, y + window_upper_half);  // exclusive
         for (int x = 0; x < w; x++)
@@ -610,15 +631,15 @@ BinaryImage binarizeGrad(
             int const imean = (int) ((mean < 0.0) ? 0.0 : (mean < 255.0) ? mean : 255.0);
             gmean_line[x] = imean;
         }
-        gmean_line += gmean_bpl;
     }
 
     double gvalue = 127.5;
     double sum_g = 0.0, sum_gi = 0.0;
-    gray_line = gray.bits();
-    gmean_line = gmean.bits();
+    #pragma omp parallel for schedule(static) reduction(+:sum_g,sum_gi)
     for (int y = 0; y < h; y++)
     {
+        uint8_t const* const gray_line = gray_data_grad + y * gray_bpl;
+        uint8_t const* const gmean_line = gmean_data + y * gmean_bpl;
         double sum_gl = 0.0;
         double sum_gil = 0.0;
         for (int x = 0; x < w; x++)
@@ -633,8 +654,6 @@ BinaryImage binarizeGrad(
         }
         sum_g += sum_gl;
         sum_gi += sum_gil;
-        gray_line += gray_bpl;
-        gmean_line += gmean_bpl;
     }
     gvalue = (sum_g > 0.0) ? (sum_gi / sum_g) : gvalue;
 
@@ -648,11 +667,14 @@ BinaryImage binarizeGrad(
     uint32_t* bw_line = bw_img.data();
     int const bw_wpl = bw_img.wordsPerLine();
 
-    gray_line = gray.bits();
-    gmean_line = gmean.bits();
+    uint32_t* const bw_data_grad = bw_img.data();
     uint32_t const msb = uint32_t(1) << 31;
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
+        uint8_t const* const gray_line = gray_data_grad + y * gray_bpl;
+        uint8_t const* const gmean_line = gmean_data + y * gmean_bpl;
+        uint32_t* const bw_line = bw_data_grad + y * bw_wpl;
         for (int x = 0; x < w; x++)
         {
             double const origin = gray_line[x];
@@ -670,9 +692,6 @@ BinaryImage binarizeGrad(
                 bw_line[x >> 5] &= ~mask;
             }
         }
-        gray_line += gray_bpl;
-        gmean_line += gmean_bpl;
-        bw_line += bw_wpl;
     }
     return bw_img;
 }  // binarizeGrad
@@ -722,9 +741,11 @@ BinaryImage binarizeEdgeDiv(
     int const window_left_half = window_size.width() >> 1;
     int const window_right_half = window_size.width() - window_left_half;
 
-    gray_line = gray.bits();
+    uint8_t* const gray_data_edge = gray.bits();
+    #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < h; y++)
     {
+        uint8_t* const gray_line = gray_data_edge + y * gray_bpl;
         int const top = std::max(0, y - window_lower_half);
         int const bottom = std::min(h, y + window_upper_half);  // exclusive
         for (int x = 0; x < w; x++)
@@ -764,7 +785,6 @@ BinaryImage binarizeEdgeDiv(
             retval = (retval < 0.0) ? 0.0 : (retval < 255.0) ? retval : 255.0;
             gray_line[x] = (int) retval;
         }
-        gray_line += gray_bpl;
     }
     return binarizeOtsu(gray, delta);
 }  // binarizeEdgeDiv

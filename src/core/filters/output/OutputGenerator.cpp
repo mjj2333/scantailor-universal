@@ -49,13 +49,17 @@
 #include "imageproc/Morphology.h"
 #include "imageproc/Connectivity.h"
 #include "imageproc/ConnCompEraser.h"
+#include "imageproc/ConnCompEraserExt.h"
 #include "imageproc/SeedFill.h"
+#include "imageproc/IntegralImage.h"
 #include "imageproc/Constants.h"
 #include "imageproc/Grayscale.h"
+#include "imageproc/GaussBlur.h"
 #include "imageproc/RasterOp.h"
 #include "imageproc/GrayRasterOp.h"
 #include "imageproc/PolynomialSurface.h"
 #include "imageproc/SavGolFilter.h"
+#include "imageproc/GaussBlur.h"
 #include "imageproc/DrawOver.h"
 #include "imageproc/AdjustBrightness.h"
 #include "imageproc/PolygonRasterizer.h"
@@ -201,6 +205,9 @@ void reserveBlackAndWhite(QImage& img)
  * are Indexed8 grayscale, RGB32 and ARGB32.
  * The \p MixedPixel type is uint8_t for Indexed8 grayscale and uint32_t
  * for RGB32 and ARGB32.
+ *
+ * Optimized to process 32 pixels at a time when the mask word is uniform
+ * (all-text or all-picture), which is the common case in scanned documents.
  */
 template<typename MixedPixel>
 void combineMixed(
@@ -216,30 +223,288 @@ void combineMixed(
     int const width = mixed.width();
     int const height = mixed.height();
     uint32_t const msb = uint32_t(1) << 31;
+    int const num_words = (width + 31) >> 5;
 
     for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            if (bw_mask_line[x >> 5] & (msb >> (x & 31))) {
-                // B/W content.
+        for (int w = 0; w < num_words; ++w) {
+            uint32_t const mask_word = bw_mask_line[w];
+            int const base = w << 5;
+            int const count = std::min(32, width - base);
 
-                uint32_t tmp = bw_content_line[x >> 5];
-                tmp >>= (31 - (x & 31));
-                tmp &= uint32_t(1);
-                // Now it's 0 for white and 1 for black.
-
-                --tmp; // 0 becomes 0xffffffff and 1 becomes 0.
-
-                tmp |= 0xff000000; // Force opacity.
-
-                mixed_line[x] = static_cast<MixedPixel>(tmp);
+            if (mask_word == 0xFFFFFFFF) {
+                // Fast path: entire word is binarized text.
+                // Expand bw_content bits to pixels branchlessly.
+                uint32_t const cw = bw_content_line[w];
+                for (int i = 0; i < count; ++i) {
+                    uint32_t bit = (cw >> (31 - i)) & uint32_t(1);
+                    --bit;              // black(1)→0x00000000, white(0)→0xFFFFFFFF
+                    bit |= 0xFF000000;  // force opacity
+                    mixed_line[base + i] = static_cast<MixedPixel>(bit);
+                }
+            } else if (mask_word == 0) {
+                // Fast path: entire word is picture/color content.
+                for (int i = 0; i < count; ++i) {
+                    mixed_line[base + i] = reserveBlackAndWhite<MixedPixel>(mixed_line[base + i]);
+                }
             } else {
-                // Non-B/W content.
-                mixed_line[x] = reserveBlackAndWhite<MixedPixel>(mixed_line[x]);
+                // Mixed word: per-bit fallback (boundary between zones).
+                uint32_t const cw = bw_content_line[w];
+                for (int i = 0; i < count; ++i) {
+                    uint32_t const bit_mask = msb >> i;
+                    if (mask_word & bit_mask) {
+                        uint32_t bit = (cw >> (31 - i)) & uint32_t(1);
+                        --bit;
+                        bit |= 0xFF000000;
+                        mixed_line[base + i] = static_cast<MixedPixel>(bit);
+                    } else {
+                        mixed_line[base + i] = reserveBlackAndWhite<MixedPixel>(mixed_line[base + i]);
+                    }
+                }
             }
         }
         mixed_line += mixed_stride;
         bw_content_line += bw_content_stride;
         bw_mask_line += bw_mask_stride;
+    }
+}
+
+
+// --------------- contour tracing helpers ---------------
+
+inline bool pixBlack(BinaryImage const& img, int x, int y)
+{
+    if (x < 0 || x >= img.width() || y < 0 || y >= img.height()) {
+        return false;
+    }
+    uint32_t const* line = img.data() + img.wordsPerLine() * y;
+    uint32_t const msb = uint32_t(1) << 31;
+    return (line[x >> 5] & (msb >> (x & 31))) != 0;
+}
+
+/**
+ * Moore boundary tracing on a single-component binary image.
+ * Traces the outer boundary of BLACK pixels, returning an ordered
+ * polygon of pixel coordinates.
+ */
+QPolygonF traceMooreBoundary(BinaryImage const& ccImg)
+{
+    int const w = ccImg.width();
+    int const h = ccImg.height();
+
+    // 8-connected clockwise: E, SE, S, SW, W, NW, N, NE
+    static int const dx[] = {1, 1, 0, -1, -1, -1, 0, 1};
+    static int const dy[] = {0, 1, 1, 1, 0, -1, -1, -1};
+
+    // Find start: topmost row, leftmost black pixel.
+    int sx = -1, sy = -1;
+    for (int y = 0; y < h && sx < 0; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (pixBlack(ccImg, x, y)) {
+                sx = x;
+                sy = y;
+                break;
+            }
+        }
+    }
+    if (sx < 0) {
+        return QPolygonF();
+    }
+
+    // Check for isolated pixel — return a unit square.
+    bool hasNeighbor = false;
+    for (int d = 0; d < 8; ++d) {
+        if (pixBlack(ccImg, sx + dx[d], sy + dy[d])) {
+            hasNeighbor = true;
+            break;
+        }
+    }
+    if (!hasNeighbor) {
+        QPolygonF p;
+        p << QPointF(sx, sy) << QPointF(sx + 1, sy)
+          << QPointF(sx + 1, sy + 1) << QPointF(sx, sy + 1);
+        return p;
+    }
+
+    QPolygonF boundary;
+    int cx = sx, cy = sy;
+    // We found start by scanning L→R, so the backtrack pixel is to the west.
+    int backDir = 4; // West
+
+    int const maxIter = w * h + 1;
+    for (int iter = 0; iter < maxIter; ++iter) {
+        boundary.append(QPointF(cx, cy));
+
+        bool found = false;
+        for (int i = 1; i <= 8; ++i) {
+            int const dir = (backDir + i) % 8;
+            int const nx = cx + dx[dir];
+            int const ny = cy + dy[dir];
+            if (pixBlack(ccImg, nx, ny)) {
+                backDir = (dir + 4) % 8;
+                cx = nx;
+                cy = ny;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+        if (cx == sx && cy == sy) {
+            break; // returned to start
+        }
+    }
+
+    return boundary;
+}
+
+/**
+ * Squared perpendicular distance from point p to line segment a–b.
+ */
+double ptLineDistSq(QPointF const& p, QPointF const& a, QPointF const& b)
+{
+    double const abx = b.x() - a.x();
+    double const aby = b.y() - a.y();
+    double const len2 = abx * abx + aby * aby;
+    if (len2 < 1e-12) {
+        double const dx = p.x() - a.x();
+        double const dy = p.y() - a.y();
+        return dx * dx + dy * dy;
+    }
+    double t = ((p.x() - a.x()) * abx + (p.y() - a.y()) * aby) / len2;
+    if (t < 0.0) t = 0.0;
+    else if (t > 1.0) t = 1.0;
+    double const dx = p.x() - (a.x() + t * abx);
+    double const dy = p.y() - (a.y() + t * aby);
+    return dx * dx + dy * dy;
+}
+
+void dpRecurse(
+    QPolygonF const& poly, int first, int last,
+    double epsSq, std::vector<bool>& keep)
+{
+    if (last - first <= 1) {
+        return;
+    }
+    double maxDistSq = 0;
+    int maxIdx = first;
+    for (int i = first + 1; i < last; ++i) {
+        double const d = ptLineDistSq(poly[i], poly[first], poly[last]);
+        if (d > maxDistSq) {
+            maxDistSq = d;
+            maxIdx = i;
+        }
+    }
+    if (maxDistSq > epsSq) {
+        keep[maxIdx] = true;
+        dpRecurse(poly, first, maxIdx, epsSq, keep);
+        dpRecurse(poly, maxIdx, last, epsSq, keep);
+    }
+}
+
+/**
+ * Douglas-Peucker polygon simplification.
+ * For a closed polygon, we split at two anchor points (0 and n/2)
+ * and simplify each arc independently.
+ */
+QPolygonF simplifyDP(QPolygonF const& poly, double epsilon)
+{
+    int const n = poly.size();
+    if (n <= 4) {
+        return poly;
+    }
+
+    double const epsSq = epsilon * epsilon;
+    int const mid = n / 2;
+
+    std::vector<bool> keep(n, false);
+    keep[0] = true;
+    keep[mid] = true;
+    keep[n - 1] = true;
+
+    dpRecurse(poly, 0, mid, epsSq, keep);
+    dpRecurse(poly, mid, n - 1, epsSq, keep);
+
+    QPolygonF result;
+    for (int i = 0; i < n; ++i) {
+        if (keep[i]) {
+            result.append(poly[i]);
+        }
+    }
+    return result;
+}
+
+/**
+ * Feathered version of combineMixed.  Uses a grayscale alpha mask
+ * (0 = full color/gray, 255 = full binarized) to blend between the
+ * original image and the binarized content at picture zone boundaries.
+ * This eliminates the hard seam visible in the binary-mask version.
+ */
+template<typename MixedPixel>
+void combineMixedFeathered(
+    QImage& mixed, BinaryImage const& bw_content,
+    GrayImage const& alpha_mask)
+{
+    MixedPixel* mixed_line = reinterpret_cast<MixedPixel*>(mixed.bits());
+    int const mixed_stride = mixed.bytesPerLine() / sizeof(MixedPixel);
+    uint32_t const* bw_content_line = bw_content.data();
+    int const bw_content_stride = bw_content.wordsPerLine();
+    uint8_t const* alpha_line = alpha_mask.data();
+    int const alpha_stride = alpha_mask.stride();
+    int const width = mixed.width();
+    int const height = mixed.height();
+    uint32_t const msb = uint32_t(1) << 31;
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int const alpha = alpha_line[x]; // 0=color, 255=binarized
+
+            if (alpha == 0) {
+                // Fully in picture zone — keep original, but reserve
+                // pure black/white.
+                mixed_line[x] = reserveBlackAndWhite<MixedPixel>(mixed_line[x]);
+            } else if (alpha == 255) {
+                // Fully in text zone — use binarized content.
+                uint32_t tmp = bw_content_line[x >> 5];
+                tmp >>= (31 - (x & 31));
+                tmp &= uint32_t(1);
+                --tmp;
+                tmp |= 0xff000000;
+                mixed_line[x] = static_cast<MixedPixel>(tmp);
+            } else {
+                // Feathered transition zone — blend.
+                // Get binarized value (0x00 for black, 0xFF for white).
+                uint32_t bw_bit = bw_content_line[x >> 5];
+                bw_bit >>= (31 - (x & 31));
+                bw_bit &= uint32_t(1);
+                uint8_t const bw_val = bw_bit ? 0x00 : 0xFF;
+
+                MixedPixel const orig = reserveBlackAndWhite<MixedPixel>(mixed_line[x]);
+
+                if (sizeof(MixedPixel) == 1) {
+                    // Grayscale: simple alpha blend.
+                    int const o = static_cast<uint8_t>(orig);
+                    int const blended = (o * (255 - alpha) + bw_val * alpha + 127) / 255;
+                    mixed_line[x] = static_cast<MixedPixel>(blended);
+                } else {
+                    // RGB32/ARGB32: blend each channel.
+                    uint32_t const o = static_cast<uint32_t>(orig);
+                    int const or_ = (o >> 16) & 0xFF;
+                    int const og  = (o >> 8)  & 0xFF;
+                    int const ob  =  o        & 0xFF;
+                    int const inv_a = 255 - alpha;
+                    int const br = (or_ * inv_a + bw_val * alpha + 127) / 255;
+                    int const bg = (og  * inv_a + bw_val * alpha + 127) / 255;
+                    int const bb = (ob  * inv_a + bw_val * alpha + 127) / 255;
+                    mixed_line[x] = static_cast<MixedPixel>(
+                        0xFF000000u | (br << 16) | (bg << 8) | bb
+                    );
+                }
+            }
+        }
+        mixed_line += mixed_stride;
+        bw_content_line += bw_content_stride;
+        alpha_line += alpha_stride;
     }
 }
 
@@ -435,21 +700,450 @@ OutputGenerator::estimateBinarizationMask(
 
     // Light areas indicate pictures.
     GrayImage picture_areas(detectPictures(downscaled_input, status, dbg));
+
+    status.throwIfCancelled();
+
+    // Local variance analysis — detect continuous-tone photo texture.
+    //
+    // The gradient-based detector misses photos with smooth/uniform regions
+    // (sky, walls, skin in even lighting) that produce weak gradients.
+    // Local standard deviation in a sliding window distinguishes:
+    //   - Text: bimodal (ink + paper) → very high σ near edges or very low σ
+    //   - Photos: continuous-tone → moderate σ (~12-60)
+    //   - Background: uniform → very low σ (<5)
+    // The "moderate σ" band is a strong picture indicator.
+    {
+        int const w = downscaled_input.width();
+        int const h = downscaled_input.height();
+
+        IntegralImage<uint32_t> integral_sum(w, h);
+        IntegralImage<uint64_t> integral_sqsum(w, h);
+
+        uint8_t const* gray_line = downscaled_input.data();
+        int const gray_stride = downscaled_input.stride();
+        for (int y = 0; y < h; ++y, gray_line += gray_stride) {
+            integral_sum.beginRow();
+            integral_sqsum.beginRow();
+            for (int x = 0; x < w; ++x) {
+                uint32_t const pixel = gray_line[x];
+                integral_sum.push(pixel);
+                integral_sqsum.push(pixel * pixel);
+            }
+        }
+
+        int const half_win = 10; // 21x21 window at 300 DPI
+        GrayImage variance_score(QSize(w, h));
+        uint8_t* vs_line = variance_score.data();
+        int const vs_stride = variance_score.stride();
+
+        for (int y = 0; y < h; ++y, vs_line += vs_stride) {
+            for (int x = 0; x < w; ++x) {
+                int const x0 = std::max(0, x - half_win);
+                int const y0 = std::max(0, y - half_win);
+                int const x1 = std::min(w - 1, x + half_win);
+                int const y1 = std::min(h - 1, y + half_win);
+
+                QRect const rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+                int const area = rect.width() * rect.height();
+
+                double const mean = (double)integral_sum.sum(rect) / area;
+                double const variance =
+                    (double)integral_sqsum.sum(rect) / area - mean * mean;
+                double const stddev = sqrt(std::max(0.0, variance));
+
+                int score;
+                if (stddev < 12.0) {
+                    score = 0;
+                } else if (stddev < 20.0) {
+                    score = (int)(255.0 * (stddev - 12.0) / 8.0);
+                } else if (stddev <= 55.0) {
+                    score = 255;
+                } else if (stddev < 70.0) {
+                    score = (int)(255.0 * (70.0 - stddev) / 15.0);
+                } else {
+                    score = 0;
+                }
+
+                vs_line[x] = (uint8_t)std::min(255, std::max(0, score));
+            }
+        }
+
+        if (dbg) {
+            dbg->add(variance_score, "variance_score");
+        }
+
+        // Morphological cleaning: threshold, close, open.
+        BinaryImage variance_bw(variance_score, BinaryThreshold(128));
+        variance_bw = closeBrick(variance_bw, QSize(3, 3));
+        variance_bw = openBrick(variance_bw, QSize(9, 9));
+
+        if (dbg) {
+            dbg->add(variance_bw, "variance_cleaned");
+        }
+
+        // Combine with existing picture_areas using pixel-wise maximum.
+        uint8_t* pa_line = picture_areas.data();
+        int const pa_stride = picture_areas.stride();
+        uint32_t const* vbw_data = variance_bw.data();
+        int const vbw_wpl = variance_bw.wordsPerLine();
+        uint32_t const msb = uint32_t(1) << 31;
+        for (int y = 0; y < h; ++y) {
+            uint32_t const* vbw_line = vbw_data + vbw_wpl * y;
+            for (int x = 0; x < w; ++x) {
+                if (vbw_line[x >> 5] & (msb >> (x & 31))) {
+                    pa_line[x] = 255;
+                }
+            }
+            pa_line += pa_stride;
+        }
+
+        if (dbg) {
+            dbg->add(picture_areas, "picture_areas_boosted");
+        }
+    }
+
+    status.throwIfCancelled();
+
+    // Text evidence suppression.
+    //
+    // The gradient-based detector can falsely classify large display
+    // fonts (chapter titles, headings, drop caps) as pictures because
+    // their gradient features are large enough to survive the morphological
+    // opening.  ContentBoxFinder::estimateTextMask() solves this using
+    // fill-factor and UEP analysis, but that result is discarded before
+    // reaching the output stage.
+    //
+    // We perform a lightweight version here: binarize the input,
+    // horizontal closing to connect characters into text-line blobs,
+    // then check each connected component for text-line properties
+    // (fill factor 15-70%, width > 3x height).  Qualifying regions
+    // have their picture likelihood suppressed to zero.
+    {
+        BinaryImage bw_content(downscaled_input, BinaryThreshold::otsuThreshold(downscaled_input));
+
+        // Horizontal closing connects characters within a text line.
+        // 30px at 300 DPI ≈ 2.5mm, bridges inter-character gaps but
+        // does not bridge inter-column gaps.
+        BinaryImage closed(closeBrick(bw_content, QSize(30, 1)));
+
+        int const pa_w = picture_areas.width();
+        int const pa_h = picture_areas.height();
+
+        ConnCompEraserExt eraser(closed, CONN4);
+        for (;;) {
+            ConnComp const cc(eraser.nextConnComp());
+            if (cc.isNull()) {
+                break;
+            }
+
+            QRect const& r = cc.rect();
+
+            // Text lines are significantly wider than tall.
+            if (r.width() < r.height() * 3) {
+                continue;
+            }
+
+            // Skip tiny components (noise).
+            if (r.width() < 20 || r.height() < 4) {
+                continue;
+            }
+
+            // Compute fill factor of original content within this CC's rect.
+            int black_pixels = 0;
+            int total_pixels = r.width() * r.height();
+            uint32_t const* bw_line = bw_content.data() + bw_content.wordsPerLine() * r.top();
+            int const bw_wpl = bw_content.wordsPerLine();
+            uint32_t const msb = uint32_t(1) << 31;
+            for (int y = r.top(); y <= r.bottom(); ++y, bw_line += bw_wpl) {
+                for (int x = r.left(); x <= r.right(); ++x) {
+                    if (bw_line[x >> 5] & (msb >> (x & 31))) {
+                        ++black_pixels;
+                    }
+                }
+            }
+
+            double const fill = (double)black_pixels / total_pixels;
+
+            // Text lines typically have fill factor 15-70%.
+            // Below 15% is mostly whitespace (not a text line).
+            // Above 70% is a solid block (rule, border, filled shape).
+            if (fill < 0.15 || fill > 0.70) {
+                continue;
+            }
+
+            // This CC looks like a text line — suppress picture
+            // likelihood in this region.
+            uint8_t* pa_line = picture_areas.data() + picture_areas.stride() * r.top();
+            int const pa_stride = picture_areas.stride();
+            int const clamp_bottom = std::min(r.bottom(), pa_h - 1);
+            int const clamp_right = std::min(r.right(), pa_w - 1);
+            for (int y = r.top(); y <= clamp_bottom; ++y, pa_line += pa_stride) {
+                for (int x = r.left(); x <= clamp_right; ++x) {
+                    pa_line[x] = 0;
+                }
+            }
+        }
+    }
+
+    // Halftone detection.
+    //
+    // Halftone photographs in older printed material (pre-1990s books,
+    // newspapers, magazines) reproduce continuous-tone images using
+    // regular patterns of small dots.  At 300 DPI, typical halftone
+    // screens (85-150 lpi) produce dots spaced 2-4 pixels apart with
+    // dot diameters of 1-2 pixels.
+    //
+    // The gradient-based detector often fails on halftones because the
+    // gradient is distributed at dot-scale intervals, making the
+    // response look text-like (many small sharp transitions rather
+    // than the broad transitions of a continuous-tone photograph).
+    //
+    // Key insight: halftone dots are much smaller than text character
+    // strokes.  A 3x3 morphological opening destroys most halftone
+    // dots (they don't survive the erosion) but preserves text strokes
+    // (which are wider and connected).  The fraction of black pixels
+    // that disappear after opening — the "vanishing ratio" — is very
+    // high for halftone (>60%) and low for text (<30%).
+    //
+    // Algorithm: binarize, open with 3x3, divide into tiles, compute
+    // vanishing ratio per tile, boost picture likelihood in tiles where
+    // the ratio indicates halftone.
+    {
+        BinaryImage bw_input(downscaled_input,
+            BinaryThreshold::otsuThreshold(downscaled_input));
+        BinaryImage opened(openBrick(bw_input, QSize(3, 3), WHITE));
+
+        int const w = downscaled_input.width();
+        int const h = downscaled_input.height();
+        int const tile_size = 32;
+        int const bw_wpl = bw_input.wordsPerLine();
+        int const op_wpl = opened.wordsPerLine();
+        uint32_t const* bw_data = bw_input.data();
+        uint32_t const* op_data = opened.data();
+        uint32_t const msb = uint32_t(1) << 31;
+
+        uint8_t* pa_data = picture_areas.data();
+        int const pa_stride = picture_areas.stride();
+
+        for (int ty = 0; ty < h; ty += tile_size) {
+            int const y_end = std::min(ty + tile_size, h);
+            for (int tx = 0; tx < w; tx += tile_size) {
+                int const x_end = std::min(tx + tile_size, w);
+                int const tile_area = (y_end - ty) * (x_end - tx);
+
+                // Count black pixels in original and in opened version.
+                int orig_black = 0;
+                int survived_black = 0;
+                for (int y = ty; y < y_end; ++y) {
+                    uint32_t const* bw_line = bw_data + bw_wpl * y;
+                    uint32_t const* op_line = op_data + op_wpl * y;
+                    for (int x = tx; x < x_end; ++x) {
+                        uint32_t const bit = msb >> (x & 31);
+                        int const word = x >> 5;
+                        if (bw_line[word] & bit) {
+                            ++orig_black;
+                        }
+                        if (op_line[word] & bit) {
+                            ++survived_black;
+                        }
+                    }
+                }
+
+                // Skip tiles with negligible content.
+                if (orig_black < tile_area / 20) {  // < 5% density
+                    continue;
+                }
+
+                double const vanishing_ratio =
+                    1.0 - (double)survived_black / orig_black;
+
+                // Halftone: most dots vanish after 3x3 opening.
+                // Text: most strokes survive.
+                // Threshold at 0.55 — halftone typically > 0.65,
+                // text typically < 0.30.  The gap is wide.
+                if (vanishing_ratio < 0.55) {
+                    continue;
+                }
+
+                // Also require minimum dot density (vanished pixels
+                // per tile area) to reject sparse noise.
+                int const vanished = orig_black - survived_black;
+                if (vanished < tile_area / 30) {  // < ~3.3%
+                    continue;
+                }
+
+                // This tile is likely halftone — boost picture
+                // likelihood to maximum.
+                for (int y = ty; y < y_end; ++y) {
+                    uint8_t* pa_line = pa_data + pa_stride * y;
+                    for (int x = tx; x < x_end; ++x) {
+                        pa_line[x] = 0xff;
+                    }
+                }
+            }
+        }
+    }
+
     downscaled_input = GrayImage(); // Save memory.
 
     status.throwIfCancelled();
 
-    BinaryThreshold const threshold(
-        //BinaryThreshold::mokjiThreshold(picture_areas, 5, 26)
-        48
-    );
+    // Hysteresis thresholding for the picture likelihood map.
+    //
+    // A single global threshold (even adaptive via Otsu) cuts off soft
+    // photo margins where the picture likelihood gradually decreases.
+    // Hysteresis uses two thresholds: T_high creates confident seeds,
+    // T_low defines candidates.  Seeds grow into adjacent candidates
+    // via flood fill, capturing soft margins without adding noise.
+    {
+        int const w = picture_areas.width();
+        int const h = picture_areas.height();
+        int const total_pixels = w * h;
 
-    // Scale back to original size.
-    picture_areas = scaleToGray(
-                        picture_areas, source_sub_rect.size()
-                    );
+        int t_high = 80; // fallback for no-picture pages
+        int t_low = 40;
 
-    return BinaryImage(picture_areas, threshold);
+        if (total_pixels > 0) {
+            // Count pixels above a moderate level.  If fewer than 0.5%
+            // of pixels are bright, there are likely no real pictures —
+            // use high thresholds to avoid false positives from noise.
+            int bright_pixels = 0;
+            uint8_t const* pa_line = picture_areas.data();
+            int const pa_stride = picture_areas.stride();
+            for (int y = 0; y < h; ++y, pa_line += pa_stride) {
+                for (int x = 0; x < w; ++x) {
+                    if (pa_line[x] >= 80) {
+                        ++bright_pixels;
+                    }
+                }
+            }
+
+            if (bright_pixels >= total_pixels / 200) {
+                // Sufficient picture content — use Otsu for T_high.
+                int otsu = BinaryThreshold::otsuThreshold(picture_areas);
+                t_high = std::max(30, std::min(80, otsu));
+                t_low = std::max(30, t_high * 6 / 10);
+            }
+        }
+
+        // Create seed mask: high-confidence picture pixels.
+        BinaryImage seeds(w, h, WHITE);
+        // Create candidate mask: potential picture pixels.
+        BinaryImage candidates(w, h, WHITE);
+        {
+            uint8_t const* pa_line = picture_areas.data();
+            int const pa_stride = picture_areas.stride();
+            uint32_t* seed_data = seeds.data();
+            int const seed_wpl = seeds.wordsPerLine();
+            uint32_t* cand_data = candidates.data();
+            int const cand_wpl = candidates.wordsPerLine();
+            uint32_t const msb = uint32_t(1) << 31;
+
+            for (int y = 0; y < h; ++y, pa_line += pa_stride) {
+                uint32_t* seed_line = seed_data + seed_wpl * y;
+                uint32_t* cand_line = cand_data + cand_wpl * y;
+                for (int x = 0; x < w; ++x) {
+                    uint8_t const val = pa_line[x];
+                    if (val >= t_high) {
+                        seed_line[x >> 5] |= (msb >> (x & 31));
+                    }
+                    if (val >= t_low) {
+                        cand_line[x >> 5] |= (msb >> (x & 31));
+                    }
+                }
+            }
+        }
+
+        // Break thin bridges in candidate mask so seedFill cannot
+        // grow from photo regions into adjacent text through narrow gaps.
+        candidates = openBrick(candidates, QSize(3, 3));
+
+        if (dbg) {
+            dbg->add(seeds, "hysteresis_seeds");
+        }
+
+        // Region growing: grow seeds into adjacent candidates.
+        BinaryImage result_bw(seedFill(seeds, candidates, CONN8));
+
+        if (dbg) {
+            dbg->add(result_bw, "hysteresis_result");
+        }
+
+        // Convert hysteresis result to GrayImage for scaling.
+        // BLACK (1) in result_bw = picture pixel → 255 in gray.
+        GrayImage result_gray(QSize(w, h));
+        memset(result_gray.data(), 0, result_gray.stride() * h);
+        {
+            uint8_t* rg_line = result_gray.data();
+            int const rg_stride = result_gray.stride();
+            uint32_t const* rbw_data = result_bw.data();
+            int const rbw_wpl = result_bw.wordsPerLine();
+            uint32_t const msb = uint32_t(1) << 31;
+            for (int y = 0; y < h; ++y) {
+                uint32_t const* rbw_line = rbw_data + rbw_wpl * y;
+                for (int x = 0; x < w; ++x) {
+                    if (rbw_line[x >> 5] & (msb >> (x & 31))) {
+                        rg_line[x] = 255;
+                    }
+                }
+                rg_line += rg_stride;
+            }
+        }
+
+        // Scale back to original size.
+        result_gray = scaleToGray(result_gray, source_sub_rect.size());
+
+        // In the result: 255 = picture, 0 = text/background.
+        // BinaryThreshold convention: gray < threshold → BLACK (1).
+        // We need BLACK = text, WHITE = picture, so picture pixels
+        // (255) must be >= threshold → WHITE, and non-picture (0)
+        // must be < threshold → BLACK.
+        return BinaryImage(result_gray, BinaryThreshold(128));
+    }
+}
+
+GrayImage
+OutputGenerator::featherMask(BinaryImage const& bw_mask, float sigma)
+{
+    // Convert the binary binarization mask into a soft (grayscale) mask
+    // with feathered transitions at picture zone boundaries.
+    //
+    // The binary mask has sharp 0/1 transitions that produce visible
+    // seams in the output where binarized text abruptly meets color/gray
+    // picture content.  Gaussian blur on the mask creates a smooth
+    // gradient zone ~3*sigma pixels wide on each side of the boundary.
+    //
+    // Convention: 0 = picture zone (keep color), 255 = text zone (binarize).
+    // This matches the binary mask where BLACK (1) = text, WHITE (0) = picture,
+    // but inverted to grayscale levels.
+
+    int const w = bw_mask.width();
+    int const h = bw_mask.height();
+
+    if (w <= 0 || h <= 0) {
+        return GrayImage(QSize(w, h));
+    }
+
+    // Convert: BLACK pixels (text) → 255, WHITE pixels (picture) → 0.
+    GrayImage gray(QSize(w, h));
+    uint8_t* gray_line = gray.data();
+    int const gray_stride = gray.stride();
+    uint32_t const* bw_line = bw_mask.data();
+    int const bw_wpl = bw_mask.wordsPerLine();
+    uint32_t const msb = uint32_t(1) << 31;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            gray_line[x] = (bw_line[x >> 5] & (msb >> (x & 31))) ? 255 : 0;
+        }
+        gray_line += gray_stride;
+        bw_line += bw_wpl;
+    }
+
+    // Gaussian blur creates the feathered transition.
+    // sigma=2.0 at 300 DPI → ~6 pixel transition zone ≈ 0.5mm,
+    // which is visually smooth but doesn't noticeably blur text.
+    return gaussBlur(gray, sigma, sigma);
 }
 
 void
@@ -810,6 +1504,17 @@ OutputGenerator::processWithoutDewarping(TaskStatus const& status, FilterData co
                           small_margins_rect, dbg
                       );
 
+            // Boost picture mask with color information.
+            // Regions with significant chrominance are almost certainly
+            // pictures, regardless of what the gradient-based detector found.
+            if (!input.origImage().allGray()) {
+                QImage color_output = transform(
+                    input.origImage(), m_xform.transform(),
+                    small_margins_rect, OutsidePixels::assumeColor(Qt::white)
+                );
+                boostMaskWithChroma(bw_mask, color_output, m_dpi);
+            }
+
             if (dbg) {
                 dbg->add(bw_mask, "bw_mask");
             }
@@ -817,18 +1522,21 @@ OutputGenerator::processWithoutDewarping(TaskStatus const& status, FilterData co
             //Picture_Shape
             if (render_params.pictureZonesLayer()) {
                 if (!picture_zones.auto_zones_found()) {
+                    std::vector<QPolygonF> contours;
+                    contourize(bw_mask, contours, GlobalStaticSettings::m_picture_detection_sensitivity);
                     std::vector<QRect> areas;
-                    bw_mask.rectangularize(WHITE, areas, GlobalStaticSettings::m_picture_detection_sensitivity);
+                    // Scale merge distance proportionally to output DPI.
+                    // The default of 16 was tuned for 300 DPI.
+                    int const merge_dist = std::max(1, 16 * m_dpi.horizontal() / 300);
+                    bw_mask.rectangularize(WHITE, areas, GlobalStaticSettings::m_picture_detection_sensitivity, merge_dist);
 
                     QTransform xform1(m_xform.transform());
                     xform1 *= QTransform().translate(-small_margins_rect.x(), -small_margins_rect.y());
 
                     QTransform inv_xform(xform1.inverted());
 
-                    for (int i = 0; i < (int)areas.size(); i++) {
-                        QRectF area0(areas[i]);
-                        QPolygonF area1(area0);
-                        QPolygonF area(inv_xform.map(area1));
+                    for (int i = 0; i < (int)contours.size(); i++) {
+                        QPolygonF area(inv_xform.map(contours[i]));
 
                         Zone zone1(area);
 
@@ -1010,15 +1718,17 @@ OutputGenerator::processWithoutDewarping(TaskStatus const& status, FilterData co
         }
 
         if (maybe_normalized.format() == QImage::Format_Indexed8) {
-            combineMixed<uint8_t>(
-                maybe_normalized, bw_content, bw_mask
+            GrayImage const soft_mask(featherMask(bw_mask));
+            combineMixedFeathered<uint8_t>(
+                maybe_normalized, bw_content, soft_mask
             );
         } else {
             assert(maybe_normalized.format() == QImage::Format_RGB32
                    || maybe_normalized.format() == QImage::Format_ARGB32);
 
-            combineMixed<uint32_t>(
-                maybe_normalized, bw_content, bw_mask
+            GrayImage const soft_mask(featherMask(bw_mask));
+            combineMixedFeathered<uint32_t>(
+                maybe_normalized, bw_content, soft_mask
             );
         }
     }
@@ -1225,24 +1935,34 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
             small_margins_rect, dbg
         ).swap(warped_bw_mask);
 
+        // Boost picture mask with color information.
+        if (color_original) {
+            QImage color_output = transform(
+                input.origImage(), m_xform.transform(),
+                small_margins_rect, OutsidePixels::assumeColor(Qt::white)
+            );
+            boostMaskWithChroma(warped_bw_mask, color_output, m_dpi);
+        }
+
         if (dbg) {
             dbg->add(warped_bw_mask, "warped_bw_mask");
         }
 
         if (render_params.pictureZonesLayer()) {
             if (!picture_zones.auto_zones_found()) {
+                std::vector<QPolygonF> contours;
+                contourize(warped_bw_mask, contours, GlobalStaticSettings::m_picture_detection_sensitivity);
                 std::vector<QRect> areas;
-                warped_bw_mask.rectangularize(WHITE, areas, GlobalStaticSettings::m_picture_detection_sensitivity);
+                int const merge_dist = std::max(1, 16 * m_dpi.horizontal() / 300);
+                warped_bw_mask.rectangularize(WHITE, areas, GlobalStaticSettings::m_picture_detection_sensitivity, merge_dist);
 
                 QTransform xform1(m_xform.transform());
                 xform1 *= QTransform().translate(-small_margins_rect.x(), -small_margins_rect.y());
 
                 QTransform inv_xform(xform1.inverted());
 
-                for (int i = 0; i < (int)areas.size(); i++) {
-                    QRectF area0(areas[i]);
-                    QPolygonF area1(area0);
-                    QPolygonF area(inv_xform.map(area1));
+                for (int i = 0; i < (int)contours.size(); i++) {
+                    QPolygonF area(inv_xform.map(contours[i]));
 
                     Zone zone1(area);
 
@@ -1378,7 +2098,7 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
 
                         QPointF pt(top_x, bottom_polyline.front().y());
 
-                        new_bottom_polyline.push_back(pt);
+                        new_bottom_polyline.push_back(inv_transform.map(pt));
 
                         for (int i = 0; i < (int)bottom_polyline.size(); i++) {
                             new_bottom_polyline.push_back(inv_transform.map(bottom_polyline[i]));
@@ -1390,13 +2110,13 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
 
                         QPointF pt(bottom_x, top_polyline.front().y());
 
-                        new_top_polyline.push_back(pt);
+                        new_top_polyline.push_back(inv_transform.map(pt));
 
                         for (int i = 0; i < (int)top_polyline.size(); i++) {
                             new_top_polyline.push_back(inv_transform.map(top_polyline[i]));
                         }
 
-                        distortion_model.setBottomCurve(dewarping::Curve(new_top_polyline));
+                        distortion_model.setTopCurve(dewarping::Curve(new_top_polyline));
                     }
                 }
             } else {
@@ -1421,7 +2141,7 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
                             new_bottom_polyline.push_back(inv_transform.map(bottom_polyline[i]));
                         }
 
-                        new_bottom_polyline.push_back(pt);
+                        new_bottom_polyline.push_back(inv_transform.map(pt));
 
                         distortion_model.setBottomCurve(dewarping::Curve(new_bottom_polyline));
                     } else {
@@ -1433,9 +2153,9 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
                             new_top_polyline.push_back(inv_transform.map(top_polyline[i]));
                         }
 
-                        new_top_polyline.push_back(pt);
+                        new_top_polyline.push_back(inv_transform.map(pt));
 
-                        distortion_model.setBottomCurve(dewarping::Curve(new_top_polyline));
+                        distortion_model.setTopCurve(dewarping::Curve(new_top_polyline));
                     }
                 }
             }
@@ -1504,11 +2224,11 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
 
         if (pageId.subPage() == PageId::SINGLE_PAGE || pageId.subPage() == PageId::LEFT_PAGE) {
             for (int i = 29 - max_red_points; i < 29; i++) {
-                bottom_spline.appendControlPoint(top_line.pointAt((float)i / 29.0), 1);
+                bottom_spline.appendControlPoint(bottom_line.pointAt((float)i / 29.0), 1);
             }
         } else {
             for (int i = 1; i <= max_red_points; i++) {
-                bottom_spline.appendControlPoint(top_line.pointAt((float)i / 29.0), 1);
+                bottom_spline.appendControlPoint(bottom_line.pointAt((float)i / 29.0), 1);
             }
         }
 
@@ -1722,15 +2442,17 @@ OutputGenerator::processWithDewarping(TaskStatus const& status, FilterData const
         }
 
         if (dewarped.format() == QImage::Format_Indexed8) {
-            combineMixed<uint8_t>(
-                dewarped, dewarped_bw_content, dewarped_bw_mask
+            GrayImage const soft_mask(featherMask(dewarped_bw_mask));
+            combineMixedFeathered<uint8_t>(
+                dewarped, dewarped_bw_content, soft_mask
             );
         } else {
             assert(dewarped.format() == QImage::Format_RGB32
                    || dewarped.format() == QImage::Format_ARGB32);
 
-            combineMixed<uint32_t>(
-                dewarped, dewarped_bw_content, dewarped_bw_mask
+            GrayImage const soft_mask(featherMask(dewarped_bw_mask));
+            combineMixedFeathered<uint32_t>(
+                dewarped, dewarped_bw_content, soft_mask
             );
         }
     }
@@ -1895,6 +2617,332 @@ OutputGenerator::fillMarginsInPlace(
     }
 }
 
+void
+OutputGenerator::boostMaskWithChroma(
+    BinaryImage& mask, QImage const& color_source,
+    Dpi const& dpi)
+{
+    if (color_source.isNull() || color_source.allGray()) {
+        return;
+    }
+
+    QSize const mask_size(mask.size());
+    if (mask_size.isEmpty()) {
+        return;
+    }
+
+    // Downscale the color source to 300 DPI for analysis,
+    // matching the resolution used by detectPictures().
+    QSize const downscaled_size(to300dpi(mask_size, dpi));
+    if (downscaled_size.isEmpty()) {
+        return;
+    }
+
+    QImage small_color = color_source.scaled(
+        downscaled_size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation
+    ).convertToFormat(QImage::Format_RGB32);
+
+    int const w = small_color.width();
+    int const h = small_color.height();
+
+    // Build a binary chroma mask: WHITE = significant color present.
+    // Any pixel with substantial chrominance is almost certainly part
+    // of a picture -- text is black/gray on white/cream background.
+    //
+    // Chroma metric: max(|R-G|, |R-B|, |G-B|).
+    // Threshold of 25 catches visible color while ignoring the slight
+    // warm/cool tint of aged paper or scanner white balance drift.
+    BinaryImage chroma_mask(QSize(w, h), BLACK);
+    int const chroma_thresh = 25;
+
+    for (int y = 0; y < h; ++y) {
+        QRgb const* src_line = reinterpret_cast<QRgb const*>(
+            small_color.constScanLine(y)
+        );
+        for (int x = 0; x < w; ++x) {
+            int const r = qRed(src_line[x]);
+            int const g = qGreen(src_line[x]);
+            int const b = qBlue(src_line[x]);
+            int const rg = abs(r - g);
+            int const rb = abs(r - b);
+            int const gb = abs(g - b);
+            int const chroma = std::max(rg, std::max(rb, gb));
+            if (chroma > chroma_thresh) {
+                chroma_mask.setPixel(x, y, WHITE);
+            }
+        }
+    }
+
+    small_color = QImage(); // Save memory.
+
+    // Morphological close to bridge small gaps within colored regions
+    // (halftone dots, dithering, JPEG artifacts in color areas).
+    chroma_mask = closeBrick(chroma_mask, QSize(5, 5), WHITE);
+
+    // Remove isolated small specks of color (stains, noise).
+    // Opening removes tiny white regions that don't form coherent areas.
+    chroma_mask = openBrick(chroma_mask, QSize(7, 7), WHITE);
+
+    // Scale back to mask dimensions.
+    GrayImage chroma_gray = scaleToGray(
+        GrayImage(chroma_mask.toQImage()), mask_size
+    );
+    chroma_mask = BinaryImage(); // Save memory.
+
+    BinaryImage chroma_upscaled(chroma_gray, BinaryThreshold(128));
+    chroma_gray = GrayImage();
+
+    // OR the chroma detections into the existing gradient-based mask.
+    rasterOp<RopOr<RopSrc, RopDst> >(mask, chroma_upscaled);
+}
+
+void
+OutputGenerator::contourize(
+    BinaryImage const& mask, std::vector<QPolygonF>& contours,
+    int sensitivity)
+{
+    int const w = mask.width();
+    int const h = mask.height();
+    if (w < 10 || h < 10) return;
+
+    uint32_t const msb = uint32_t(1) << 31;
+    BinaryImage const origInv(mask.inverted());
+
+    // STEP 1: Majority-vote 4x downscale to filter halftone dots.
+    int const scale = 6;
+    int const sw = (w + scale - 1) / scale;
+    int const sh = (h + scale - 1) / scale;
+    int const voteThr = (scale * scale) / 4;  // 25% coverage = picture
+
+    BinaryImage small(sw, sh, WHITE);
+    for (int dy = 0; dy < sh; ++dy) {
+        int const yFrom = dy * scale;
+        int const yTo = std::min(yFrom + scale, h);
+        uint32_t* dstLine = small.data() + small.wordsPerLine() * dy;
+        for (int dx = 0; dx < sw; ++dx) {
+            int const xFrom = dx * scale;
+            int const xTo = std::min(xFrom + scale, w);
+            int count = 0;
+            for (int y = yFrom; y < yTo; ++y) {
+                uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+                for (int x = xFrom; x < xTo; ++x) {
+                    if (row[x >> 5] & (msb >> (x & 31))) ++count;
+                }
+            }
+            if (count >= voteThr) {
+                dstLine[dx >> 5] |= (msb >> (dx & 31));
+            }
+        }
+    }
+
+    // STEP 2: Morphological merge at reduced resolution.
+    small = closeBrick(small, QSize(25, 25));
+    small = openBrick(small, QSize(3, 3));
+
+    // Upscale back.
+    BinaryImage regionMask(w, h, WHITE);
+    for (int dy = 0; dy < sh; ++dy) {
+        int const yFrom = dy * scale;
+        int const yTo = std::min(yFrom + scale, h);
+        uint32_t const* srcRow = small.data() + small.wordsPerLine() * dy;
+        for (int dx = 0; dx < sw; ++dx) {
+            if (srcRow[dx >> 5] & (msb >> (dx & 31))) {
+                int const xFrom = dx * scale;
+                int const xTo = std::min(xFrom + scale, w);
+                for (int y = yFrom; y < yTo; ++y) {
+                    uint32_t* row = regionMask.data() + regionMask.wordsPerLine() * y;
+                    for (int x = xFrom; x < xTo; ++x) {
+                        row[x >> 5] |= (msb >> (x & 31));
+                    }
+                }
+            }
+        }
+    }
+
+    regionMask = closeBrick(regionMask, QSize(9, 9));
+    regionMask = openBrick(regionMask, QSize(9, 9));
+
+    // STEP 3: Find regions, tight bounds from original mask.
+    int const pageArea = w * h;
+    int const minRegion = std::max(2000, pageArea * (200 - sensitivity) / 20000);
+
+    std::vector<QRectF> rawRects;
+
+    ConnCompEraserExt eraser(regionMask, CONN8);
+    for (;;) {
+        ConnComp const region(eraser.nextConnComp());
+        if (region.isNull()) break;
+        if (region.pixCount() < minRegion) continue;
+
+        QRect const rr(region.rect());
+        int const rx = rr.left();
+        int const ry = rr.top();
+        int const rw = rr.width();
+        int const rh = rr.height();
+
+        int tLeft = rx + rw - 1, tRight = rx;
+        int tTop = ry + rh - 1, tBottom = ry;
+
+        for (int y = ry; y < ry + rh && y < h; ++y) {
+            uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+            for (int x = rx; x < rx + rw && x < w; ++x) {
+                if (row[x >> 5] & (msb >> (x & 31))) {
+                    if (x < tLeft) tLeft = x;
+                    if (x > tRight) tRight = x;
+                    if (y < tTop) tTop = y;
+                    if (y > tBottom) tBottom = y;
+                }
+            }
+        }
+
+        if (tLeft > tRight || tTop > tBottom) continue;
+
+        double const pad = 3.0;
+        QRectF tight(
+            tLeft - pad, tTop - pad,
+            (tRight - tLeft + 1) + 2 * pad,
+            (tBottom - tTop + 1) + 2 * pad);
+
+        QPolygonF boundary;
+        boundary << tight.topLeft() << tight.topRight()
+                 << tight.bottomRight() << tight.bottomLeft();
+        // Collect raw rects for merging.
+        rawRects.push_back(tight);
+    }
+
+    // ================================================================
+    // STEP 4: Merge overlapping or nearby rectangles.
+    //         Photos split by internal gaps become one zone.
+    // ================================================================
+    double const mergeDist = 20.0;  // merge rects within 20px
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        for (size_t i = 0; i < rawRects.size(); ++i) {
+            for (size_t j = i + 1; j < rawRects.size(); ++j) {
+                QRectF a = rawRects[i];
+                QRectF b = rawRects[j];
+                // Expand both by mergeDist and check overlap.
+                QRectF ae(a.left() - mergeDist, a.top() - mergeDist,
+                          a.width() + 2*mergeDist, a.height() + 2*mergeDist);
+                if (ae.intersects(b)) {
+                    rawRects[i] = a.united(b);
+                    rawRects.erase(rawRects.begin() + j);
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) break;
+        }
+    }
+
+    // ================================================================
+    // STEP 4b: Absorb thin strips into nearest larger zone.
+    //          Thin zones (aspect ratio > 6:1) near a larger zone
+    //          are fragments of the same photo.
+    // ================================================================
+    bool absorbed = true;
+    while (absorbed) {
+        absorbed = false;
+        for (size_t i = 0; i < rawRects.size(); ++i) {
+            QRectF const& r = rawRects[i];
+            double aspect = r.width() / std::max(1.0, r.height());
+            if (aspect < 6.0 && (1.0 / aspect) < 6.0) continue; // not a thin strip
+            // Find nearest other zone
+            double bestDist = 1e9;
+            int bestIdx = -1;
+            for (size_t j = 0; j < rawRects.size(); ++j) {
+                if (j == i) continue;
+                QRectF const& other = rawRects[j];
+                // Distance between edges
+                double dx = std::max(0.0, std::max(r.left() - other.right(), other.left() - r.right()));
+                double dy = std::max(0.0, std::max(r.top() - other.bottom(), other.top() - r.bottom()));
+                double dist = std::sqrt(dx*dx + dy*dy);
+                if (dist < bestDist) { bestDist = dist; bestIdx = (int)j; }
+            }
+            if (bestIdx >= 0 && bestDist < 80.0) {
+                rawRects[bestIdx] = rawRects[bestIdx].united(r);
+                rawRects.erase(rawRects.begin() + i);
+                absorbed = true;
+                break;
+            }
+        }
+    }
+
+    // ================================================================
+    // STEP 5: Trim sparse edges and emit final contours.
+    //         Removes text pixels that bleed into photo zones.
+    // ================================================================
+    for (size_t i = 0; i < rawRects.size(); ++i) {
+        QRectF r = rawRects[i];
+        int rl = std::max(0, (int)r.left());
+        int rt = std::max(0, (int)r.top());
+        int rr = std::min(w - 1, (int)r.right());
+        int rb = std::min(h - 1, (int)r.bottom());
+
+        // Skip edge trim for zones spanning most of the page width.
+        // These are full-bleed photos that do not need trimming.
+        bool const wideZone = (rr - rl + 1) > w * 4 / 5;
+
+        // Trim top: skip rows with <30% fill in original mask.
+        int rowLen = rr - rl + 1;
+        int trimThr = rowLen * 3 / 10;
+        while (rt < rb) {
+            int count = 0;
+            uint32_t const* row = origInv.data() + origInv.wordsPerLine() * rt;
+            for (int x = rl; x <= rr; ++x) {
+                if (row[x >> 5] & (msb >> (x & 31))) ++count;
+            }
+            if (count >= trimThr) break;
+            ++rt;
+        }
+
+        // Trim bottom.
+        while (rb > rt) {
+            int count = 0;
+            uint32_t const* row = origInv.data() + origInv.wordsPerLine() * rb;
+            for (int x = rl; x <= rr; ++x) {
+                if (row[x >> 5] & (msb >> (x & 31))) ++count;
+            }
+            if (count >= trimThr) break;
+            --rb;
+        }
+
+        // Trim left.
+        int colLen = rb - rt + 1;
+        int colThr = colLen * 3 / 10;
+        while (rl < rr) {
+            int count = 0;
+            for (int y = rt; y <= rb; ++y) {
+                uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+                if (row[rl >> 5] & (msb >> (rl & 31))) ++count;
+            }
+            if (count >= colThr) break;
+            ++rl;
+        }
+
+        // Trim right.
+        while (rr > rl) {
+            int count = 0;
+            for (int y = rt; y <= rb; ++y) {
+                uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+                if (row[rr >> 5] & (msb >> (rr & 31))) ++count;
+            }
+            if (count >= colThr) break;
+            --rr;
+        }
+
+        double const pad = 3.0;
+        QRectF final(rl - pad, rt - pad,
+                     (rr - rl + 1) + 2*pad, (rb - rt + 1) + 2*pad);
+
+        QPolygonF boundary;
+        boundary << final.topLeft() << final.topRight()
+                 << final.bottomRight() << final.bottomLeft();
+        contours.push_back(boundary);
+    }
+}
+
 GrayImage
 OutputGenerator::detectPictures(
     GrayImage const& input_300dpi, TaskStatus const& status,
@@ -1912,19 +2960,9 @@ OutputGenerator::detectPictures(
 
     status.throwIfCancelled();
 
+    // Fine-scale gradient (3x3): captures sharp edges.
     GrayImage eroded(erodeGray(stretched, QSize(3, 3), 0x00));
-    if (dbg) {
-        dbg->add(eroded, "eroded");
-    }
-
-    status.throwIfCancelled();
-
     GrayImage dilated(dilateGray(stretched, QSize(3, 3), 0xff));
-    if (dbg) {
-        dbg->add(dilated, "dilated");
-    }
-
-    stretched = GrayImage(); // Save memory.
 
     status.throwIfCancelled();
 
@@ -1932,13 +2970,131 @@ OutputGenerator::detectPictures(
     GrayImage gray_gradient(dilated);
     dilated = GrayImage();
     eroded = GrayImage();
+
+    // Multi-scale gradient analysis.
+    //
+    // The original single-scale 3x3 gradient captures sharp edges well
+    // but responds weakly to gradual intensity transitions found in
+    // photographs with soft focus, watercolors, and smooth gradients.
+    // A coarser 9x9 gradient responds more strongly to these broad
+    // transitions while still capturing text edges.
+    //
+    // We compute the coarse gradient, then take the pixel-wise maximum
+    // with the fine gradient.  This boosts picture regions with gradual
+    // transitions (where the 9x9 gradient is significantly stronger
+    // than the 3x3) while leaving text edges unchanged (both scales
+    // produce similar magnitudes for sharp step edges).
+    //
+    // The combined gradient then goes through the single opening-by-
+    // reconstruction pipeline, which removes text-scale features and
+    // preserves picture-scale features as before.
+    {
+        GrayImage coarse_eroded(erodeGray(stretched, QSize(9, 9), 0x00));
+        GrayImage coarse_dilated(dilateGray(stretched, QSize(9, 9), 0xff));
+
+        status.throwIfCancelled();
+
+        grayRasterOp<CombineInverted>(coarse_dilated, coarse_eroded);
+        // coarse_dilated now holds the coarse gradient.
+        coarse_eroded = GrayImage();
+
+        // Pixel-wise maximum: boost gray_gradient where the coarse
+        // gradient is stronger.
+        int const w = gray_gradient.width();
+        int const h = gray_gradient.height();
+        uint8_t* fine_line = gray_gradient.data();
+        int const fine_stride = gray_gradient.stride();
+        uint8_t const* coarse_line = coarse_dilated.data();
+        int const coarse_stride = coarse_dilated.stride();
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                if (coarse_line[x] > fine_line[x]) {
+                    fine_line[x] = coarse_line[x];
+                }
+            }
+            fine_line += fine_stride;
+            coarse_line += coarse_stride;
+        }
+    }
+
+    stretched = GrayImage(); // Save memory.
+
     if (dbg) {
         dbg->add(gray_gradient, "gray_gradient");
     }
 
     status.throwIfCancelled();
 
-    GrayImage marker(erodeGray(gray_gradient, QSize(35, 35), 0x00));
+    // Adaptive structuring element size for the opening-by-reconstruction.
+    //
+    // The original hardcoded 35x35 was tuned for ~12pt text at 300 DPI
+    // (line spacing ~33px).  Large display fonts (chapter titles, headings)
+    // have gradient features that survive a 35x35 erosion and get falsely
+    // classified as pictures.  Small dense text (footnotes, CJK) has the
+    // opposite problem -- the SE is too large relative to the features.
+    //
+    // We estimate the dominant text line spacing from the horizontal
+    // projection profile of the gradient image, then set the SE size
+    // to approximately match it.  This ensures the SE always removes
+    // text-scale gradient features while preserving picture-scale ones.
+    int se_size = 35; // default fallback
+    {
+        int const w = gray_gradient.width();
+        int const h = gray_gradient.height();
+
+        if (w > 40 && h > 80) {
+            // Compute horizontal projection profile: sum of gradient
+            // values per row.  Text lines produce periodic peaks.
+            std::vector<double> profile(h, 0.0);
+            uint8_t const* line = gray_gradient.data();
+            int const stride = gray_gradient.stride();
+            for (int y = 0; y < h; ++y, line += stride) {
+                double sum = 0;
+                for (int x = 0; x < w; ++x) {
+                    sum += line[x];
+                }
+                profile[y] = sum;
+            }
+
+            // Autocorrelation to find dominant line spacing.
+            // Search for the first peak between lags 10 and 80 pixels
+            // (at 300 DPI: ~0.85mm to ~6.8mm, covering 6pt to ~50pt text).
+            int const min_lag = 10;
+            int const max_lag = std::min(80, h / 3);
+            double best_corr = 0;
+            int best_lag = 0;
+
+            // Compute mean for zero-centering.
+            double mean = 0;
+            for (int y = 0; y < h; ++y) {
+                mean += profile[y];
+            }
+            mean /= h;
+
+            for (int lag = min_lag; lag <= max_lag; ++lag) {
+                double corr = 0;
+                int const n = h - lag;
+                for (int y = 0; y < n; ++y) {
+                    corr += (profile[y] - mean) * (profile[y + lag] - mean);
+                }
+                if (corr > best_corr) {
+                    best_corr = corr;
+                    best_lag = lag;
+                }
+            }
+
+            if (best_lag >= min_lag) {
+                // SE size ≈ line spacing, clamped to [21, 71] and forced odd.
+                se_size = best_lag;
+                se_size = std::max(21, std::min(71, se_size));
+                if ((se_size & 1) == 0) {
+                    ++se_size;
+                }
+            }
+        }
+    }
+
+    GrayImage marker(erodeGray(gray_gradient, QSize(se_size, se_size), 0x00));
     if (dbg) {
         dbg->add(marker, "marker");
     }
@@ -1976,23 +3132,26 @@ OutputGenerator::detectPictures(
 QImage
 OutputGenerator::smoothToGrayscale(QImage const& src, Dpi const& dpi)
 {
+    // Convert to grayscale first (matches the old savGolFilter behavior).
+    GrayImage gray(toGrayscale(src));
+
+    // Choose sigma to approximate the smoothing extent of the former
+    // Savitzky-Golay filter at each DPI bracket.  The Gaussian blur uses
+    // an O(1)-per-pixel IIR implementation regardless of sigma, making it
+    // 10-50x faster than the O(window^2)-per-pixel SavGol polynomial fit.
     int const min_dpi = std::min(dpi.horizontal(), dpi.vertical());
-    int window;
-    int degree;
+    float sigma;
     if (min_dpi <= 200) {
-        window = 5;
-        degree = 3;
+        sigma = 0.8f;    // was SavGol window=5, degree=3
     } else if (min_dpi <= 400) {
-        window = 7;
-        degree = 4;
+        sigma = 1.2f;    // was SavGol window=7, degree=4
     } else if (min_dpi <= 800) {
-        window = 11;
-        degree = 4;
+        sigma = 2.0f;    // was SavGol window=11, degree=4
     } else {
-        window = 11;
-        degree = 2;
+        sigma = 2.0f;    // was SavGol window=11, degree=2
     }
-    return savGolFilter(src, QSize(window, window), degree, degree);
+
+    return gaussBlur(gray, sigma, sigma);
 }
 
 BinaryThreshold
@@ -2300,49 +3459,146 @@ OutputGenerator::hitMissReplaceAllDirections(
     imageproc::BinaryImage& img, char const* const pattern,
     int const pattern_width, int const pattern_height)
 {
-    hitMissReplaceInPlace(img, WHITE, pattern, pattern_width, pattern_height);
+    // Parse a rotated pattern into hit/miss/replace point lists and
+    // compute the match image + apply replacements.
+    // This is factored as a lambda to avoid repeating it 4 times.
 
-    std::vector<char> pattern_data(pattern_width * pattern_height, ' ');
-    char* const new_pattern = &pattern_data[0];
+    struct PatternInfo {
+        std::vector<QPoint> hits;
+        std::vector<QPoint> misses;
+        std::vector<QPoint> white_to_black;
+        std::vector<QPoint> black_to_white;
+    };
 
-    // Rotate 90 degrees clockwise.
-    char const* p = pattern;
-    int new_width = pattern_height;
-    int new_height = pattern_width;
+    auto parsePattern = [](char const* pat, int pw, int ph) -> PatternInfo {
+        PatternInfo info;
+        // Find origin at first replacement position (same logic as hitMissReplaceInPlace).
+        int const pat_len = pw * ph;
+        char const* minus_pos = (char const*)memchr(pat, '-', pat_len);
+        char const* plus_pos = (char const*)memchr(pat, '+', pat_len);
+        char const* origin_pos;
+        if (minus_pos && plus_pos)
+            origin_pos = std::min(minus_pos, plus_pos);
+        else if (minus_pos)
+            origin_pos = minus_pos;
+        else if (plus_pos)
+            origin_pos = plus_pos;
+        else
+            return info;
+
+        QPoint const origin(
+            (origin_pos - pat) % pw,
+            (origin_pos - pat) / pw
+        );
+        char const* p = pat;
+        for (int y = 0; y < ph; ++y) {
+            for (int x = 0; x < pw; ++x, ++p) {
+                switch (*p) {
+                case '-':
+                    info.black_to_white.push_back(QPoint(x, y) - origin);
+                    info.hits.push_back(QPoint(x, y) - origin);
+                    break;
+                case 'X':
+                    info.hits.push_back(QPoint(x, y) - origin);
+                    break;
+                case '+':
+                    info.white_to_black.push_back(QPoint(x, y) - origin);
+                    info.misses.push_back(QPoint(x, y) - origin);
+                    break;
+                case ' ':
+                    info.misses.push_back(QPoint(x, y) - origin);
+                    break;
+                case '?':
+                    break;
+                }
+            }
+        }
+        return info;
+    };
+
+    auto applyReplacements = [](BinaryImage& dst, BinaryImage const& matches,
+                                PatternInfo const& info) {
+        QRect const rect(dst.rect());
+        for (QPoint const& offset : info.white_to_black) {
+            QRect dst_rect = rect.translated(offset).intersected(rect);
+            if (dst_rect.isEmpty()) continue;
+            QPoint src_origin = dst_rect.topLeft() - offset;
+            rasterOp<RopOr<RopSrc, RopDst>>(dst, dst_rect, matches, src_origin);
+        }
+        for (QPoint const& offset : info.black_to_white) {
+            QRect dst_rect = rect.translated(offset).intersected(rect);
+            if (dst_rect.isEmpty()) continue;
+            QPoint src_origin = dst_rect.topLeft() - offset;
+            rasterOp<RopSubtract<RopDst, RopSrc>>(dst, dst_rect, matches, src_origin);
+        }
+    };
+
+    // Build all 4 rotated patterns up front.
+    int const pat_len = pattern_width * pattern_height;
+
+    struct RotatedPattern {
+        std::vector<char> data;
+        int width;
+        int height;
+    };
+
+    RotatedPattern rotations[4];
+
+    // Rotation 0: original.
+    rotations[0].data.assign(pattern, pattern + pat_len);
+    rotations[0].width = pattern_width;
+    rotations[0].height = pattern_height;
+
+    // Rotation 1: 90 degrees clockwise.
+    rotations[1].data.resize(pat_len, ' ');
+    rotations[1].width = pattern_height;
+    rotations[1].height = pattern_width;
     for (int y = 0; y < pattern_height; ++y) {
-        for (int x = 0; x < pattern_width; ++x, ++p) {
-            int const new_x = pattern_height - 1 - y;
-            int const new_y = x;
-            new_pattern[new_y * new_width + new_x] = *p;
+        for (int x = 0; x < pattern_width; ++x) {
+            rotations[1].data[x * pattern_height + (pattern_height - 1 - y)] =
+                pattern[y * pattern_width + x];
         }
     }
-    hitMissReplaceInPlace(img, WHITE, new_pattern, new_width, new_height);
 
-    // Rotate upside down.
-    p = pattern;
-    new_width = pattern_width;
-    new_height = pattern_height;
+    // Rotation 2: 180 degrees.
+    rotations[2].data.resize(pat_len, ' ');
+    rotations[2].width = pattern_width;
+    rotations[2].height = pattern_height;
     for (int y = 0; y < pattern_height; ++y) {
-        for (int x = 0; x < pattern_width; ++x, ++p) {
-            int const new_x = pattern_width - 1 - x;
-            int const new_y = pattern_height - 1 - y;
-            new_pattern[new_y * new_width + new_x] = *p;
+        for (int x = 0; x < pattern_width; ++x) {
+            rotations[2].data[(pattern_height - 1 - y) * pattern_width + (pattern_width - 1 - x)] =
+                pattern[y * pattern_width + x];
         }
     }
-    hitMissReplaceInPlace(img, WHITE, new_pattern, new_width, new_height);
 
-    // Rotate 90 degrees counter-clockwise.
-    p = pattern;
-    new_width = pattern_height;
-    new_height = pattern_width;
+    // Rotation 3: 90 degrees counter-clockwise.
+    rotations[3].data.resize(pat_len, ' ');
+    rotations[3].width = pattern_height;
+    rotations[3].height = pattern_width;
     for (int y = 0; y < pattern_height; ++y) {
-        for (int x = 0; x < pattern_width; ++x, ++p) {
-            int const new_x = y;
-            int const new_y = pattern_width - 1 - x;
-            new_pattern[new_y * new_width + new_x] = *p;
+        for (int x = 0; x < pattern_width; ++x) {
+            rotations[3].data[(pattern_width - 1 - x) * pattern_height + y] =
+                pattern[y * pattern_width + x];
         }
     }
-    hitMissReplaceInPlace(img, WHITE, new_pattern, new_width, new_height);
+
+    // Snapshot the image so all 4 rotations match against a consistent
+    // state.  This eliminates false interactions where one rotation's
+    // replacement creates or destroys a match for another rotation.
+    BinaryImage const snapshot(img);
+
+    // Compute matches and apply replacements for all 4 rotations.
+    for (int r = 0; r < 4; ++r) {
+        PatternInfo info = parsePattern(
+            rotations[r].data.data(), rotations[r].width, rotations[r].height);
+
+        if (info.hits.empty() && info.misses.empty()) continue;
+
+        BinaryImage const matches(
+            hitMissMatch(snapshot, WHITE, info.hits, info.misses));
+
+        applyReplacements(img, matches, info);
+    }
 }
 
 QSize
