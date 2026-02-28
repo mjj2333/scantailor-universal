@@ -51,6 +51,7 @@
 #include "imageproc/ConnCompEraser.h"
 #include "imageproc/ConnCompEraserExt.h"
 #include "imageproc/SeedFill.h"
+#include "imageproc/IntegralImage.h"
 #include "imageproc/Constants.h"
 #include "imageproc/Grayscale.h"
 #include "imageproc/GaussBlur.h"
@@ -702,6 +703,107 @@ OutputGenerator::estimateBinarizationMask(
 
     status.throwIfCancelled();
 
+    // Local variance analysis — detect continuous-tone photo texture.
+    //
+    // The gradient-based detector misses photos with smooth/uniform regions
+    // (sky, walls, skin in even lighting) that produce weak gradients.
+    // Local standard deviation in a sliding window distinguishes:
+    //   - Text: bimodal (ink + paper) → very high σ near edges or very low σ
+    //   - Photos: continuous-tone → moderate σ (~12-60)
+    //   - Background: uniform → very low σ (<5)
+    // The "moderate σ" band is a strong picture indicator.
+    {
+        int const w = downscaled_input.width();
+        int const h = downscaled_input.height();
+
+        IntegralImage<uint32_t> integral_sum(w, h);
+        IntegralImage<uint64_t> integral_sqsum(w, h);
+
+        uint8_t const* gray_line = downscaled_input.data();
+        int const gray_stride = downscaled_input.stride();
+        for (int y = 0; y < h; ++y, gray_line += gray_stride) {
+            integral_sum.beginRow();
+            integral_sqsum.beginRow();
+            for (int x = 0; x < w; ++x) {
+                uint32_t const pixel = gray_line[x];
+                integral_sum.push(pixel);
+                integral_sqsum.push(pixel * pixel);
+            }
+        }
+
+        int const half_win = 10; // 21x21 window at 300 DPI
+        GrayImage variance_score(QSize(w, h));
+        uint8_t* vs_line = variance_score.data();
+        int const vs_stride = variance_score.stride();
+
+        for (int y = 0; y < h; ++y, vs_line += vs_stride) {
+            for (int x = 0; x < w; ++x) {
+                int const x0 = std::max(0, x - half_win);
+                int const y0 = std::max(0, y - half_win);
+                int const x1 = std::min(w - 1, x + half_win);
+                int const y1 = std::min(h - 1, y + half_win);
+
+                QRect const rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+                int const area = rect.width() * rect.height();
+
+                double const mean = (double)integral_sum.sum(rect) / area;
+                double const variance =
+                    (double)integral_sqsum.sum(rect) / area - mean * mean;
+                double const stddev = sqrt(std::max(0.0, variance));
+
+                int score;
+                if (stddev < 12.0) {
+                    score = 0;
+                } else if (stddev < 20.0) {
+                    score = (int)(255.0 * (stddev - 12.0) / 8.0);
+                } else if (stddev <= 55.0) {
+                    score = 255;
+                } else if (stddev < 70.0) {
+                    score = (int)(255.0 * (70.0 - stddev) / 15.0);
+                } else {
+                    score = 0;
+                }
+
+                vs_line[x] = (uint8_t)std::min(255, std::max(0, score));
+            }
+        }
+
+        if (dbg) {
+            dbg->add(variance_score, "variance_score");
+        }
+
+        // Morphological cleaning: threshold, close, open.
+        BinaryImage variance_bw(variance_score, BinaryThreshold(128));
+        variance_bw = closeBrick(variance_bw, QSize(9, 9));
+        variance_bw = openBrick(variance_bw, QSize(9, 9));
+
+        if (dbg) {
+            dbg->add(variance_bw, "variance_cleaned");
+        }
+
+        // Combine with existing picture_areas using pixel-wise maximum.
+        uint8_t* pa_line = picture_areas.data();
+        int const pa_stride = picture_areas.stride();
+        uint32_t const* vbw_data = variance_bw.data();
+        int const vbw_wpl = variance_bw.wordsPerLine();
+        uint32_t const msb = uint32_t(1) << 31;
+        for (int y = 0; y < h; ++y) {
+            uint32_t const* vbw_line = vbw_data + vbw_wpl * y;
+            for (int x = 0; x < w; ++x) {
+                if (vbw_line[x >> 5] & (msb >> (x & 31))) {
+                    pa_line[x] = 255;
+                }
+            }
+            pa_line += pa_stride;
+        }
+
+        if (dbg) {
+            dbg->add(picture_areas, "picture_areas_boosted");
+        }
+    }
+
+    status.throwIfCancelled();
+
     // Text evidence suppression.
     //
     // The gradient-based detector can falsely classify large display
@@ -886,30 +988,25 @@ OutputGenerator::estimateBinarizationMask(
 
     status.throwIfCancelled();
 
-    // Adaptive threshold for the picture likelihood map.
+    // Hysteresis thresholding for the picture likelihood map.
     //
-    // The original hardcoded threshold of 48 worked for typical pages but
-    // was too aggressive on low-contrast scans (false picture detections)
-    // and too conservative on high-contrast photographic content (missed
-    // pictures).  The commented-out mokjiThreshold was presumably abandoned
-    // because it was unreliable on the heavily skewed distribution this
-    // image produces.
-    //
-    // We use Otsu's method, which finds the optimal threshold to separate
-    // two classes (text/background vs. pictures).  Safety bounds [30, 80]
-    // prevent pathological results.  If the image has almost no bright
-    // pixels (no pictures present), we use a high threshold to suppress
-    // noise-driven false positives.
-    BinaryThreshold threshold(48); // fallback
+    // A single global threshold (even adaptive via Otsu) cuts off soft
+    // photo margins where the picture likelihood gradually decreases.
+    // Hysteresis uses two thresholds: T_high creates confident seeds,
+    // T_low defines candidates.  Seeds grow into adjacent candidates
+    // via flood fill, capturing soft margins without adding noise.
     {
         int const w = picture_areas.width();
         int const h = picture_areas.height();
         int const total_pixels = w * h;
 
+        int t_high = 80; // fallback for no-picture pages
+        int t_low = 40;
+
         if (total_pixels > 0) {
             // Count pixels above a moderate level.  If fewer than 0.5%
             // of pixels are bright, there are likely no real pictures —
-            // use a high threshold to avoid false positives from noise.
+            // use high thresholds to avoid false positives from noise.
             int bright_pixels = 0;
             uint8_t const* pa_line = picture_areas.data();
             int const pa_stride = picture_areas.stride();
@@ -921,27 +1018,84 @@ OutputGenerator::estimateBinarizationMask(
                 }
             }
 
-            if (bright_pixels < total_pixels / 200) {
-                // No significant picture content detected.
-                threshold = BinaryThreshold(80);
-            } else {
-                // Otsu's method on the picture likelihood image.
+            if (bright_pixels >= total_pixels / 200) {
+                // Sufficient picture content — use Otsu for T_high.
                 int otsu = BinaryThreshold::otsuThreshold(picture_areas);
-
-                // Clamp to [30, 80] — below 30 classifies too much as
-                // picture (noise), above 80 misses real pictures.
-                otsu = std::max(30, std::min(80, otsu));
-                threshold = BinaryThreshold(otsu);
+                t_high = std::max(30, std::min(80, otsu));
+                t_low = std::max(15, t_high * 5 / 10);
             }
         }
+
+        // Create seed mask: high-confidence picture pixels.
+        BinaryImage seeds(w, h, WHITE);
+        // Create candidate mask: potential picture pixels.
+        BinaryImage candidates(w, h, WHITE);
+        {
+            uint8_t const* pa_line = picture_areas.data();
+            int const pa_stride = picture_areas.stride();
+            uint32_t* seed_data = seeds.data();
+            int const seed_wpl = seeds.wordsPerLine();
+            uint32_t* cand_data = candidates.data();
+            int const cand_wpl = candidates.wordsPerLine();
+            uint32_t const msb = uint32_t(1) << 31;
+
+            for (int y = 0; y < h; ++y, pa_line += pa_stride) {
+                uint32_t* seed_line = seed_data + seed_wpl * y;
+                uint32_t* cand_line = cand_data + cand_wpl * y;
+                for (int x = 0; x < w; ++x) {
+                    uint8_t const val = pa_line[x];
+                    if (val >= t_high) {
+                        seed_line[x >> 5] |= (msb >> (x & 31));
+                    }
+                    if (val >= t_low) {
+                        cand_line[x >> 5] |= (msb >> (x & 31));
+                    }
+                }
+            }
+        }
+
+        if (dbg) {
+            dbg->add(seeds, "hysteresis_seeds");
+        }
+
+        // Region growing: grow seeds into adjacent candidates.
+        BinaryImage result_bw(seedFill(seeds, candidates, CONN8));
+
+        if (dbg) {
+            dbg->add(result_bw, "hysteresis_result");
+        }
+
+        // Convert hysteresis result to GrayImage for scaling.
+        // BLACK (1) in result_bw = picture pixel → 255 in gray.
+        GrayImage result_gray(QSize(w, h));
+        memset(result_gray.data(), 0, result_gray.stride() * h);
+        {
+            uint8_t* rg_line = result_gray.data();
+            int const rg_stride = result_gray.stride();
+            uint32_t const* rbw_data = result_bw.data();
+            int const rbw_wpl = result_bw.wordsPerLine();
+            uint32_t const msb = uint32_t(1) << 31;
+            for (int y = 0; y < h; ++y) {
+                uint32_t const* rbw_line = rbw_data + rbw_wpl * y;
+                for (int x = 0; x < w; ++x) {
+                    if (rbw_line[x >> 5] & (msb >> (x & 31))) {
+                        rg_line[x] = 255;
+                    }
+                }
+                rg_line += rg_stride;
+            }
+        }
+
+        // Scale back to original size.
+        result_gray = scaleToGray(result_gray, source_sub_rect.size());
+
+        // In the result: 255 = picture, 0 = text/background.
+        // BinaryThreshold convention: gray < threshold → BLACK (1).
+        // We need BLACK = text, WHITE = picture, so picture pixels
+        // (255) must be >= threshold → WHITE, and non-picture (0)
+        // must be < threshold → BLACK.
+        return BinaryImage(result_gray, BinaryThreshold(128));
     }
-
-    // Scale back to original size.
-    picture_areas = scaleToGray(
-                        picture_areas, source_sub_rect.size()
-                    );
-
-    return BinaryImage(picture_areas, threshold);
 }
 
 GrayImage
@@ -2543,67 +2697,244 @@ OutputGenerator::contourize(
     BinaryImage const& mask, std::vector<QPolygonF>& contours,
     int sensitivity)
 {
-    // Convert the picture mask to contour polygons that tightly follow
-    // the actual picture boundaries, replacing the axis-aligned rectangles
-    // produced by rectangularize().
-    //
-    // Algorithm:
-    //   1. Morphological close to bridge small gaps between fragments
-    //      of the same picture (similar to rectangularize's 16px merge).
-    //   2. Small dilation to add a safety margin around picture edges.
-    //   3. Connected component iteration.
-    //   4. Moore boundary tracing per component.
-    //   5. Douglas-Peucker simplification to reduce vertex count.
+    int const w = mask.width();
+    int const h = mask.height();
+    if (w < 10 || h < 10) return;
 
-    // Invert: WHITE (picture) → BLACK (foreground for CC iteration).
-    BinaryImage inv(mask.inverted());
+    uint32_t const msb = uint32_t(1) << 31;
+    BinaryImage const origInv(mask.inverted());
 
-    // Close with 15×15 to bridge gaps up to ~14px (comparable to
-    // rectangularize's 16px horizontal merge distance).
-    inv = closeBrick(inv, QSize(15, 15));
+    // STEP 1: Majority-vote 4x downscale to filter halftone dots.
+    int const scale = 6;
+    int const sw = (w + scale - 1) / scale;
+    int const sh = (h + scale - 1) / scale;
+    int const voteThr = (scale * scale) / 4;  // 25% coverage = picture
 
-    // Dilate by 3×3 to add a 1-pixel margin so the polygon doesn't
-    // cut into the picture edge.
-    inv = dilateBrick(inv, QSize(3, 3));
+    BinaryImage small(sw, sh, WHITE);
+    for (int dy = 0; dy < sh; ++dy) {
+        int const yFrom = dy * scale;
+        int const yTo = std::min(yFrom + scale, h);
+        uint32_t* dstLine = small.data() + small.wordsPerLine() * dy;
+        for (int dx = 0; dx < sw; ++dx) {
+            int const xFrom = dx * scale;
+            int const xTo = std::min(xFrom + scale, w);
+            int count = 0;
+            for (int y = yFrom; y < yTo; ++y) {
+                uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+                for (int x = xFrom; x < xTo; ++x) {
+                    if (row[x >> 5] & (msb >> (x & 31))) ++count;
+                }
+            }
+            if (count >= voteThr) {
+                dstLine[dx >> 5] |= (msb >> (dx & 31));
+            }
+        }
+    }
 
-    // Minimum component area.  Higher sensitivity keeps smaller zones.
-    // At default sensitivity (100): min_area = 500 pixels (~1.4mm²).
-    int const minArea = std::max(100, 500 * (200 - sensitivity) / 100);
+    // STEP 2: Morphological merge at reduced resolution.
+    small = closeBrick(small, QSize(25, 25));
+    small = openBrick(small, QSize(3, 3));
 
-    ConnCompEraserExt eraser(inv, CONN8);
+    // Upscale back.
+    BinaryImage regionMask(w, h, WHITE);
+    for (int dy = 0; dy < sh; ++dy) {
+        int const yFrom = dy * scale;
+        int const yTo = std::min(yFrom + scale, h);
+        uint32_t const* srcRow = small.data() + small.wordsPerLine() * dy;
+        for (int dx = 0; dx < sw; ++dx) {
+            if (srcRow[dx >> 5] & (msb >> (dx & 31))) {
+                int const xFrom = dx * scale;
+                int const xTo = std::min(xFrom + scale, w);
+                for (int y = yFrom; y < yTo; ++y) {
+                    uint32_t* row = regionMask.data() + regionMask.wordsPerLine() * y;
+                    for (int x = xFrom; x < xTo; ++x) {
+                        row[x >> 5] |= (msb >> (x & 31));
+                    }
+                }
+            }
+        }
+    }
+
+    regionMask = closeBrick(regionMask, QSize(9, 9));
+    regionMask = openBrick(regionMask, QSize(9, 9));
+
+    // STEP 3: Find regions, tight bounds from original mask.
+    int const pageArea = w * h;
+    int const minRegion = std::max(2000, pageArea * (200 - sensitivity) / 20000);
+
+    std::vector<QRectF> rawRects;
+
+    ConnCompEraserExt eraser(regionMask, CONN8);
     for (;;) {
-        ConnComp const cc(eraser.nextConnComp());
-        if (cc.isNull()) {
-            break;
+        ConnComp const region(eraser.nextConnComp());
+        if (region.isNull()) break;
+        if (region.pixCount() < minRegion) continue;
+
+        QRect const rr(region.rect());
+        int const rx = rr.left();
+        int const ry = rr.top();
+        int const rw = rr.width();
+        int const rh = rr.height();
+
+        int tLeft = rx + rw - 1, tRight = rx;
+        int tTop = ry + rh - 1, tBottom = ry;
+
+        for (int y = ry; y < ry + rh && y < h; ++y) {
+            uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+            for (int x = rx; x < rx + rw && x < w; ++x) {
+                if (row[x >> 5] & (msb >> (x & 31))) {
+                    if (x < tLeft) tLeft = x;
+                    if (x > tRight) tRight = x;
+                    if (y < tTop) tTop = y;
+                    if (y > tBottom) tBottom = y;
+                }
+            }
         }
 
-        if (cc.pixCount() < minArea) {
-            continue;
+        if (tLeft > tRight || tTop > tBottom) continue;
+
+        double const pad = 3.0;
+        QRectF tight(
+            tLeft - pad, tTop - pad,
+            (tRight - tLeft + 1) + 2 * pad,
+            (tBottom - tTop + 1) + 2 * pad);
+
+        QPolygonF boundary;
+        boundary << tight.topLeft() << tight.topRight()
+                 << tight.bottomRight() << tight.bottomLeft();
+        // Collect raw rects for merging.
+        rawRects.push_back(tight);
+    }
+
+    // ================================================================
+    // STEP 4: Merge overlapping or nearby rectangles.
+    //         Photos split by internal gaps become one zone.
+    // ================================================================
+    double const mergeDist = 20.0;  // merge rects within 20px
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        for (size_t i = 0; i < rawRects.size(); ++i) {
+            for (size_t j = i + 1; j < rawRects.size(); ++j) {
+                QRectF a = rawRects[i];
+                QRectF b = rawRects[j];
+                // Expand both by mergeDist and check overlap.
+                QRectF ae(a.left() - mergeDist, a.top() - mergeDist,
+                          a.width() + 2*mergeDist, a.height() + 2*mergeDist);
+                if (ae.intersects(b)) {
+                    rawRects[i] = a.united(b);
+                    rawRects.erase(rawRects.begin() + j);
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) break;
+        }
+    }
+
+    // ================================================================
+    // STEP 4b: Absorb thin strips into nearest larger zone.
+    //          Thin zones (aspect ratio > 6:1) near a larger zone
+    //          are fragments of the same photo.
+    // ================================================================
+    bool absorbed = true;
+    while (absorbed) {
+        absorbed = false;
+        for (size_t i = 0; i < rawRects.size(); ++i) {
+            QRectF const& r = rawRects[i];
+            double aspect = r.width() / std::max(1.0, r.height());
+            if (aspect < 6.0 && (1.0 / aspect) < 6.0) continue; // not a thin strip
+            // Find nearest other zone
+            double bestDist = 1e9;
+            int bestIdx = -1;
+            for (size_t j = 0; j < rawRects.size(); ++j) {
+                if (j == i) continue;
+                QRectF const& other = rawRects[j];
+                // Distance between edges
+                double dx = std::max(0.0, std::max(r.left() - other.right(), other.left() - r.right()));
+                double dy = std::max(0.0, std::max(r.top() - other.bottom(), other.top() - r.bottom()));
+                double dist = std::sqrt(dx*dx + dy*dy);
+                if (dist < bestDist) { bestDist = dist; bestIdx = (int)j; }
+            }
+            if (bestIdx >= 0 && bestDist < 80.0) {
+                rawRects[bestIdx] = rawRects[bestIdx].united(r);
+                rawRects.erase(rawRects.begin() + i);
+                absorbed = true;
+                break;
+            }
+        }
+    }
+
+    // ================================================================
+    // STEP 5: Trim sparse edges and emit final contours.
+    //         Removes text pixels that bleed into photo zones.
+    // ================================================================
+    for (size_t i = 0; i < rawRects.size(); ++i) {
+        QRectF r = rawRects[i];
+        int rl = std::max(0, (int)r.left());
+        int rt = std::max(0, (int)r.top());
+        int rr = std::min(w - 1, (int)r.right());
+        int rb = std::min(h - 1, (int)r.bottom());
+
+        // Skip edge trim for zones spanning most of the page width.
+        // These are full-bleed photos that do not need trimming.
+        bool const wideZone = (rr - rl + 1) > w * 4 / 5;
+
+        // Trim top: skip rows with <30% fill in original mask.
+        int rowLen = rr - rl + 1;
+        int trimThr = rowLen * 3 / 10;
+        while (rt < rb) {
+            int count = 0;
+            uint32_t const* row = origInv.data() + origInv.wordsPerLine() * rt;
+            for (int x = rl; x <= rr; ++x) {
+                if (row[x >> 5] & (msb >> (x & 31))) ++count;
+            }
+            if (count >= trimThr) break;
+            ++rt;
         }
 
-        BinaryImage ccImg(eraser.computeConnCompImage());
-        QPolygonF boundary(traceMooreBoundary(ccImg));
-
-        if (boundary.size() < 3) {
-            continue;
+        // Trim bottom.
+        while (rb > rt) {
+            int count = 0;
+            uint32_t const* row = origInv.data() + origInv.wordsPerLine() * rb;
+            for (int x = rl; x <= rr; ++x) {
+                if (row[x >> 5] & (msb >> (x & 31))) ++count;
+            }
+            if (count >= trimThr) break;
+            --rb;
         }
 
-        // Douglas-Peucker simplification.  Epsilon of 2 pixels
-        // at 300 DPI ≈ 0.17mm — imperceptible deviation, but
-        // reduces a raw boundary of ~thousands of points to
-        // typically 10-30 vertices.
-        boundary = simplifyDP(boundary, 2.0);
-
-        if (boundary.size() < 3) {
-            continue;
+        // Trim left.
+        int colLen = rb - rt + 1;
+        int colThr = colLen * 3 / 10;
+        while (rl < rr) {
+            int count = 0;
+            for (int y = rt; y <= rb; ++y) {
+                uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+                if (row[rl >> 5] & (msb >> (rl & 31))) ++count;
+            }
+            if (count >= colThr) break;
+            ++rl;
         }
 
-        // Offset from component-local to mask coordinates.
-        QPointF const offset(cc.rect().topLeft());
-        for (int i = 0; i < boundary.size(); ++i) {
-            boundary[i] += offset;
+        // Trim right.
+        while (rr > rl) {
+            int count = 0;
+            for (int y = rt; y <= rb; ++y) {
+                uint32_t const* row = origInv.data() + origInv.wordsPerLine() * y;
+                if (row[rr >> 5] & (msb >> (rr & 31))) ++count;
+            }
+            if (count >= colThr) break;
+            --rr;
         }
 
+        double const pad = 3.0;
+        QRectF final(rl - pad, rt - pad,
+                     (rr - rl + 1) + 2*pad, (rb - rt + 1) + 2*pad);
+
+        QPolygonF boundary;
+        boundary << final.topLeft() << final.topRight()
+                 << final.bottomRight() << final.bottomLeft();
         contours.push_back(boundary);
     }
 }
